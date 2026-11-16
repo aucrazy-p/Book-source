@@ -1,6 +1,7 @@
 name: daily-source-pick
 
 # 每天定时采集候选源 → 规范化去重 → 探测 → 边际选源，产物上传 artifact。
+# 精选池跨轮累积（A 方案）：每轮开始下载上一轮的池状态 artifact，结束后上传本轮池状态。
 # 注意：本 workflow 无 push 触发；推送代码不会引发构建。
 on:
   schedule:
@@ -10,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # 上传 artifact + 通过 API 读上一轮池状态（write 含 read）
 
 concurrency:
   group: daily-source-pick
@@ -29,6 +31,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      # ---- 跨轮状态恢复（A 方案核心）----
+      # 从「最近一次成功运行」的 pool-state artifact 取回精选池，落到 runs/_state/pool.json。
+      # 首轮没有 artifact 时 warn 后跳过，06_pool.py 会自动从空池冷启动，不报错。
+      - name: Restore pool state from previous run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: daily.yml
+          name: pool-state
+          path: runs/_state
+          workflow_conclusion: success
+          if_no_artifact_found: warn
 
       - name: Collect candidate sources from yiove
         # 采集：按合集访问量取前 8 个，不做 3 万条全量；限速 0.8s/请求
@@ -61,6 +76,17 @@ jobs:
                                              s["hit_hot"], s["respond_time_ms"]))
           print("\n可导入文件：`bookSources.json`（artifact 内，纯标准书源数组，直接导入阅读 APP）")
           PY
+
+      # ---- 跨轮状态上传（A 方案核心）----
+      # 固定名字 pool-state，次日由上面的步骤取回。保留 90 天足够（每天覆盖生成新的）。
+      - name: Upload pool state for next run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-state
+          path: runs/_state/
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Upload artifacts
         if: always()
