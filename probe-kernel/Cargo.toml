@@ -1,0 +1,70 @@
+[package]
+name = "probe-kernel"
+version = "0.1.0"
+edition = "2021"
+
+# 探测内核：从 D:\Code\reader (reader-rust 1.6.5) 剥离而来。
+# 目的：在 Linux CI 一次性容器里真跑书源四步链路，并对 java.* 兼容层做 L4 行为观测。
+# 去掉 tauri 全家桶（GUI，Linux 需 webkit2gtk 系统库）与 axum/server/api。
+# 其余依赖沿用 reader Cargo.toml，保证 parser/crawler/service 能编译。
+
+[[bin]]
+name = "probe-kernel"
+path = "src/main.rs"
+
+[lib]
+name = "probe_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "blocking", "cookies"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror = "1"
+anyhow = "1"
+aes = "0.8"
+bytes = "1"
+cbc = "0.1"
+des = "0.8"
+ecb = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+encoding_rs = "0.8"
+cookie_store = "0.22"
+cookie = "0.18"
+flate2 = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+serde_with = "3"
+scraper = "0.20"
+jsonpath_lib = "0.3"
+regex = "1"
+rquickjs = { version = "0.7", features = ["futures"] }
+http = "1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+urlencoding = "2"
+serde_urlencoded = "0.7"
+futures = "0.3"
+rand = "0.8"
+once_cell = "1"
+tokio-stream = "0.1"
+feed-rs = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+sxd-xpath = "0.4"
+sxd-document = "0.3"
+quick-xml = "0.31"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12.0"
+
+[profile.release]
+opt-level = 2
+strip = true
+lto = false

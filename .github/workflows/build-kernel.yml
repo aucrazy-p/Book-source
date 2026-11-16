@@ -1,0 +1,58 @@
+name: build-probe-kernel
+
+# 探测二进制预编译（方案 §8）：单独 workflow，仅手动触发。
+# 产物是 Linux x86_64 ELF，供 daily.yml 的一次性容器拉取执行。
+# CI 纪律：无 schedule、无 push 触发；每次构建前由用户确认后手动 dispatch。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 上传 Release asset
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        # rquickjs 需要 C 编译器；ubuntu runner 自带 gcc，这里只补 pkg-config/libssl 等常见缺项
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config libssl-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: probe-kernel
+
+      - name: Build release
+        run: cargo build --release --manifest-path probe-kernel/Cargo.toml
+
+      - name: Smoke test (unit tests)
+        # 跑 behavior 判定单测，验证 L4 hook 逻辑（不联网）
+        run: cargo test --release --manifest-path probe-kernel/Cargo.toml behavior::tests -- --nocapture
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp probe-kernel/target/release/probe-kernel dist/
+          cd dist && tar czf probe-kernel-linux-x64.tar.gz probe-kernel
+          sha256sum probe-kernel-linux-x64.tar.gz > probe-kernel-linux-x64.tar.gz.sha256
+
+      - name: Publish release asset
+        # 用固定 tag 的 Release，重复构建覆盖同名 asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view probe-kernel >/dev/null 2>&1 || \
+            gh release create probe-kernel --title "probe-kernel" --notes "探测内核预编译产物" --target "$GITHUB_SHA"
+          gh release upload probe-kernel \
+            dist/probe-kernel-linux-x64.tar.gz \
+            dist/probe-kernel-linux-x64.tar.gz.sha256 \
+            --clobber
