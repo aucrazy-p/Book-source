@@ -40,6 +40,24 @@ POOL_SIZE = 50
 FAIL_LIMIT = 2      # 连续 FAILED 达此值移出（真失效）
 BLOCKED_LIMIT = 3   # 连续 BLOCKED 达此值移出（机房 IP 长期连不上，等价于不可用）
 
+# 成人过滤规则单一真值：复用 02_normalize 的 load_adult_patterns/is_adult。
+# 用 importlib 按路径加载（文件名以数字开头，不能用常规 import）。
+ADULT_FILTER_PY = os.path.join(HERE, "02_normalize.py")
+
+
+def _adult_blocker():
+    """返回 (is_adult_fn, 规则数)；加载失败则返回恒 False，绝不因过滤拖垮导出。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_norm02", ADULT_FILTER_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pats = mod.load_adult_patterns()
+        return (lambda s: mod.is_adult(s or {}, pats)), len(pats)
+    except Exception as e:
+        print("[池] 警告：成人过滤规则加载失败（%s），本轮跳过二次过滤" % e)
+        return (lambda s: (False, "")), 0
+
 # 状态文件：放在 runs 根目录，跨 run_id 共享
 STATE_PATH = os.path.join(runs_root(), "_state", "pool.json")
 
@@ -228,6 +246,27 @@ def commit(run_id, fail_limit, blocked_limit):
         for name, reason in gone:
             print("[池]   淘汰 %-20s (%s)" % (str(name)[:20], reason))
         print("[池] recheck：淘汰 %d 个，池内剩 %d" % (removed, len(st["pool"])))
+
+    # 导出前二次成人过滤：源头 02_normalize 已筛过新候选，但池内可能残留
+    # 旧规则漏网的源（如新变体域名）。这里再拦一道，命中即移出池并记入 retired。
+    is_adult, n_rules = _adult_blocker()
+    kept = []
+    adult_removed = []
+    for p in st["pool"]:
+        hit, ev = is_adult(p.get("source", {}))
+        if hit:
+            st["retired"][p["source_id"]] = {
+                "reason": "adult_filter:" + ev, "name": p.get("bookSourceName"),
+                "domain": p.get("domain"), "at": _now(), "round": st["round"]}
+            adult_removed.append((p.get("bookSourceName"), ev))
+        else:
+            kept.append(p)
+    if adult_removed:
+        st["pool"] = kept
+        for name, ev in adult_removed:
+            print("[池]   成人过滤移出 %s (%s)" % (name, ev))
+        print("[池] 二次成人过滤：移出 %d 个（规则 %d 条），池内剩 %d"
+              % (len(adult_removed), n_rules, len(st["pool"])))
 
     save_state(st)
 

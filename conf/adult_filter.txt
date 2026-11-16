@@ -26,5 +26,19 @@ xxx
 # BL 成人向（域名特征）
 blpopo
 
+# 御宅屋/御书屋/欲望社 一族（擦边成人站，2026-11-16 CI 实测漏网）
+# 这些站对海外 IP 友好，机房探测时反而只有它们通过，必须拦
+御宅屋
+御书屋
+御宅
+yuzehai
+yuzhai
+xyuzhaiwu
+xyushuwu
+yushuwu
+yuwangshe
+欲望社
+御书房
+
 # 分组标签里的成人标记（只匹配 bookSourceGroup）
 # 见脚本 WEAK_GROUP：涩 / 🔞 / 成人 / r18 / 敏感资源
