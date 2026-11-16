@@ -1,0 +1,30 @@
+# 成人/色情书源过滤规则（02_normalize.py 读取）
+# 每行一条正则，匹配 bookSourceName + bookSourceUrl（合并后小写）；命中即丢弃，不进探测、不导出。
+# 分组(bookSourceGroup)的成人标签由另一组 WEAK_GROUP 规则判定（见脚本），避免误伤。
+# 修改后需重跑流水线才生效；已发布的 sources.json 需单独刷新。
+
+# PO / 肉文 系列
+po18
+po文
+popo
+肉文
+肉书
+肉小说
+roushu
+powen
+
+# 直白成人关键词
+成人
+色情
+r18
+18禁
+porn
+xxx
+福利姬
+涩涩
+
+# BL 成人向（域名特征）
+blpopo
+
+# 分组标签里的成人标记（只匹配 bookSourceGroup）
+# 见脚本 WEAK_GROUP：涩 / 🔞 / 成人 / r18 / 敏感资源

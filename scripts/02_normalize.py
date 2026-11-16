@@ -22,6 +22,8 @@ SEED_LOCAL_SKILL = os.path.join(
     os.path.expanduser("~"), ".workbuddy", "skills", "book-source-validator",
     "scripts", "blacklist.py")
 SEED_REPO = os.path.join(ROOT, "conf", "blacklist_seeds.txt")
+# 成人/色情源过滤规则（名称+URL 强特征，分组弱特征）
+ADULT_FILTER = os.path.join(ROOT, "conf", "adult_filter.txt")
 
 from lib import (CONTENT_FIELDS, content_hash, dump_jsonl, dump_json,
                  extract_domain, load_json, normalize_url, run_dir, source_id)
@@ -69,6 +71,35 @@ def is_blacklisted(domain, seeds):
     return any(domain == b or domain.endswith("." + b) for b in seeds)
 
 
+# 分组标签里的成人标记——只对 bookSourceGroup 判定，避免误伤正文小说
+WEAK_GROUP = re.compile(r"涩|🔞|成人|r18|敏感资源", re.I)
+
+
+def load_adult_patterns():
+    """读 conf/adult_filter.txt 里的正则（# 注释、空行忽略）。"""
+    pats = []
+    if os.path.exists(ADULT_FILTER):
+        for line in open(ADULT_FILTER, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pats.append(line)
+    return pats
+
+
+def is_adult(s, pats):
+    """(是否成人源, 命中证据)。名称+URL 命中强规则，或分组命中弱规则。"""
+    blob = (str(s.get("bookSourceName", "") or "") + " " +
+            str(s.get("bookSourceUrl", "") or "")).lower()
+    for p in pats:
+        if re.search(p, blob, re.I):
+            return True, "adult_pattern:" + p
+    grp = str(s.get("bookSourceGroup", "") or "")
+    m = WEAK_GROUP.search(grp)
+    if m:
+        return True, "adult_group:" + m.group(0)
+    return False, ""
+
+
 def risk_scan(s):
     """静态字段风险扫描，返回 (risk_level, findings[])。"""
     findings = []
@@ -101,8 +132,9 @@ def normalize(input_path, run_id):
     if isinstance(raw, dict):
         raw = raw.get("sources") or raw.get("bookSources") or []
     seeds, seed_ok = load_seed_blacklist()
-    print("[规范化] 输入=%d 条，种子黑名单=%d 条（%s）"
-          % (len(raw), len(seeds), "已加载" if seed_ok else "未加载"))
+    adult_pats = load_adult_patterns()
+    print("[规范化] 输入=%d 条，种子黑名单=%d 条（%s），成人规则=%d 条"
+          % (len(raw), len(seeds), "已加载" if seed_ok else "未加载", len(adult_pats)))
 
     seen_sid, seen_hash, host_groups = set(), set(), defaultdict(list)
     candidates, stats = [], defaultdict(int)
@@ -113,6 +145,10 @@ def normalize(input_path, run_id):
             continue
         if str(s.get("bookSourceType", "0")) not in ("0", ""):
             stats["skip_type"] += 1
+            continue
+        adult, evidence = is_adult(s, adult_pats)
+        if adult:
+            stats["adult_filtered"] += 1
             continue
         url = str(s.get("bookSourceUrl", "") or "").strip()
         sid = source_id(url)
