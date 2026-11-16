@@ -163,11 +163,17 @@ def main():
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
 
     out_dir = run_dir(run_id)
-    cands = load_jsonl(os.path.join(out_dir, "candidates.jsonl"))
     books_obj = load_json(os.path.join(out_dir, "probe_books.json"))
-    clean = [r for r in cands if r["risk_level"] == "clean" and r["source"].get("searchUrl")]
-    if limit:
-        clean = clean[:limit]
+    # 精选池模式：若存在 06_pool plan 产出的 targets.jsonl，优先探测它（复测池内源或填充目标）
+    targets_path = os.path.join(out_dir, "targets.jsonl")
+    if os.path.exists(targets_path):
+        clean = load_jsonl(targets_path)
+        print("[探测] 使用精选池目标列表 %d 个" % len(clean))
+    else:
+        cands = load_jsonl(os.path.join(out_dir, "candidates.jsonl"))
+        clean = [r for r in cands if r["risk_level"] == "clean" and r["source"].get("searchUrl")]
+        if limit:
+            clean = clean[:limit]
     books = probe_books(books_obj)
     print("[探测] 候选=%d（仅 clean + 有 searchUrl），探针书=%d（经典%d+热门%d），并发=%d"
           % (len(clean), len(books),
