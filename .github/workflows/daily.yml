@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write  # 发布 sources.json 回本仓库 docs/（GITHUB_TOKEN push，不触发新 workflow）
   actions: write   # 上传 artifact + 通过 API 读上一轮池状态（write 含 read）
 
 concurrency:
@@ -98,36 +98,29 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ---- 联动 Bsource：把本轮精选书源推到 Bsource 仓库 sources.json ----
-      # GITHUB_TOKEN 只能写本仓库，跨仓库写必须用 PAT（secrets.BSOURCE_PUSH_TOKEN）。
-      # push 到 Bsource/main 会触发 GitHub Pages 自动重建，页面随之更新。
-      - name: Publish sources.json to Bsource
+      # ---- 联动 Pages：把本轮精选书源写回本仓库 docs/sources.json ----
+      # 单仓库方案：Book-source 自带 GitHub Pages（/docs），域名 ivv.loc.cc 挂这里。
+      # 用 GITHUB_TOKEN push 回自己仓库，不需要 PAT，也无跨仓库复制。
+      # GitHub 对 GITHUB_TOKEN 的 push 不触发新 workflow（防递归），符合 CI 纪律。
+      - name: Publish sources.json to docs/
         if: success()
-        env:
-          BSOURCE_TOKEN: ${{ secrets.BSOURCE_PUSH_TOKEN }}
         run: |
           set -e
-          if [ -z "$BSOURCE_TOKEN" ]; then
-            echo "::error::Secret BSOURCE_PUSH_TOKEN 未配置或名字不对，跳过发布"
-            exit 2
-          fi
           SRC="runs/ci/bookSources.json"
+          DST="docs/sources.json"
           if [ ! -s "$SRC" ]; then
             echo "::error::bookSources.json 不存在或为空，跳过发布"
             exit 2
           fi
           echo "发布书源数: $(python3 -c "import json;print(len(json.load(open('$SRC'))))")"
-          rm -rf .bsource-publish
-          git clone --depth 1 "https://x-access-token:${BSOURCE_TOKEN}@github.com/aucrazy-p/Bsource.git" .bsource-publish
-          cp "$SRC" .bsource-publish/sources.json
-          cd .bsource-publish
+          cp "$SRC" "$DST"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sources.json
+          git add "$DST"
           if git diff --cached --quiet; then
             echo "sources.json 内容无变化，跳过 commit（避免无意义提交）"
           else
             git commit -m "chore: 自动更新书源 ($(date -u +%Y-%m-%d))"
-            git push origin main
-            echo "::notice::已发布 sources.json 到 Bsource，Pages 将自动重建"
+            git push origin HEAD:main
+            echo "::notice::已发布 sources.json 到 docs/，Pages 将自动重建"
           fi
