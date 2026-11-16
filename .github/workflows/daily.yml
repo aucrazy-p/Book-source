@@ -57,7 +57,8 @@ jobs:
             echo "::error::采集失败：sources_snapshot.json 不存在或为空"
             exit 2
           fi
-          python3 scripts/run_pipeline.py "$SNAP" --run-id ci --limit 50 --stop 0.02
+          # --pool 必须带：否则不调用 06_pool 的 plan/commit，artifact 传来的池状态无人读写
+          python3 scripts/run_pipeline.py "$SNAP" --run-id ci --pool --limit 50 --stop 0.02
 
       - name: Publish summary
         run: |
