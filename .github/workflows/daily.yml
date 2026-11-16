@@ -1,0 +1,71 @@
+name: daily-source-pick
+
+# 每天定时采集候选源 → 规范化去重 → 探测 → 边际选源，产物上传 artifact。
+# 注意：本 workflow 无 push 触发；推送代码不会引发构建。
+on:
+  schedule:
+    # UTC 16:23 = 北京时间 00:23，避开整点拥塞（cron 在 UTC，整点易延迟/丢弃）
+    - cron: '23 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-source-pick
+  cancel-in-progress: false
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LEGADO_SY_RUNS_DIR: ${{ github.workspace }}/runs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Collect candidate sources from yiove
+        # 采集：按合集访问量取前 8 个，不做 3 万条全量；限速 0.8s/请求
+        run: python3 scripts/collect_yiove.py ci --collections 8 --pages 1
+
+      - name: Normalize, probe and select
+        # 探测 50 个候选（约 7 分钟）；checkKeyWord 判连接 + 5经典5热门交叉验证
+        run: |
+          SNAP=runs/ci/sources_snapshot.json
+          if [ ! -s "$SNAP" ]; then
+            echo "::error::采集失败：sources_snapshot.json 不存在或为空"
+            exit 2
+          fi
+          python3 scripts/run_pipeline.py "$SNAP" --run-id ci --limit 50 --stop 0.02
+
+      - name: Publish summary
+        run: |
+          echo "## 选源结果" >> $GITHUB_STEP_SUMMARY
+          python3 - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import json, os
+          p = os.path.join("runs", "ci", "white.json")
+          d = json.load(open(p, encoding="utf-8"))
+          print("精选源 **%d** 个，覆盖 %d/%d 探针书 (%.0f%%)\n"
+                % (len(d["sources"]), d["covered_books"], d["total_probe_books"],
+                   d["coverage"] * 100))
+          print("| 源 | 经典 | 热门 | 响应ms |")
+          print("|---|---|---|---|")
+          for s in d["sources"]:
+            print("| %s | %s | %s | %s |" % (s["bookSourceName"], s["hit_classic"],
+                                             s["hit_hot"], s["respond_time_ms"]))
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-pick-${{ github.run_number }}-${{ github.run_attempt }}
+          path: runs/ci/
+          retention-days: 30
+          if-no-files-found: warn
