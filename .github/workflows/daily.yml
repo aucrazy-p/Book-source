@@ -59,6 +59,7 @@ jobs:
           for s in d["sources"]:
             print("| %s | %s | %s | %s |" % (s["bookSourceName"], s["hit_classic"],
                                              s["hit_hot"], s["respond_time_ms"]))
+          print("\n可导入文件：`bookSources.json`（artifact 内，纯标准书源数组，直接导入阅读 APP）")
           PY
 
       - name: Upload artifacts

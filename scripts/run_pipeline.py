@@ -7,7 +7,9 @@ r"""一键编排 P1 流水线：01 书单 → 02 规范化去重 → 03 探测 �
 产物目录由 lib.runs_root() 决定：本地默认 WorkSync 产物目录；
 CI 上设 LEGADO_SY_RUNS_DIR=<workspace>/runs 即写到 workspace。
 输出 runs/<run_id>/：probe_books.json / candidates.jsonl / normalize_stats.json /
-matrix.jsonl / white.json / selection_curve.json
+matrix.jsonl / white.json / selection_curve.json /
+bookSources.json（可直接导入阅读 APP 的纯数组）+ import_meta.json
+需要全部合格源时，单独运行：python 05_export.py <run_id> --all-passed
 
 不联网抓上游（上游由 collect_yiove.py 单独产出快照）；本脚本只解释执行已有逻辑。
 """
@@ -36,6 +38,7 @@ def main():
         [py, os.path.join(HERE, "02_normalize.py"), src_json, run_id],
         [py, os.path.join(HERE, "03_probe.py"), run_id],
         [py, os.path.join(HERE, "04_select.py"), run_id],
+        [py, os.path.join(HERE, "05_export.py"), run_id],
     ]
     if "--limit" in sys.argv:
         steps[2] += ["--limit", sys.argv[sys.argv.index("--limit") + 1]]
@@ -44,7 +47,7 @@ def main():
 
     print("[编排] run_id=%s，书源=%s" % (run_id, src_json))
     for i, cmd in enumerate(steps, 1):
-        print("\n=== step %d/4: %s ===" % (i, os.path.basename(cmd[1])))
+        print("\n=== step %d/%d: %s ===" % (i, len(steps), os.path.basename(cmd[1])))
         rc = subprocess.call(cmd, cwd=HERE)
         if rc != 0:
             print("[编排] 步骤 %d 失败（rc=%d），中止" % (i, rc))
