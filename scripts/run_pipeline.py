@@ -39,20 +39,26 @@ def main():
         else datetime.now().strftime("%Y%m%dT%H%M%S")
     py = sys.executable  # 用当前解释器，CI 上是 python3，避免硬编码 python 不存在
 
+    # 注意：各子脚本参数约定不统一——01/03/04/05 是 <run_id> 在前，
+    # 但 02_normalize 是 <input> <run_id>、06_pool 是 <cmd> <run_id>。
+    # 这里为这两个例外单独构造命令，避免把 run_id 传进 input/cmd 位。
     def cmd(script, *args):
         return [py, os.path.join(HERE, script), run_id] + list(args)
+
+    def cmd_raw(script, *args):
+        return [py, os.path.join(HERE, script)] + list(args)
 
     pool_mode = "--pool" in sys.argv  # 精选池模式：跨轮累积、恒定维持 50 个
     steps = [
         cmd("01_fetch_probe_books.py"),
-        cmd("02_normalize.py", src_json),
+        cmd_raw("02_normalize.py", src_json, run_id),     # 02 约定 <input> <run_id>
     ]
     if pool_mode:
-        steps.append(cmd("06_pool.py", "plan"))          # 决定本轮模式 + 目标
+        steps.append(cmd_raw("06_pool.py", "plan", run_id))  # 06 约定 <cmd> <run_id>
     steps.append(cmd("03_probe.py"))
     steps.append(cmd("04_select.py"))                     # 本轮白名单（参考）
     if pool_mode:
-        steps.append(cmd("06_pool.py", "commit"))         # 并入池 + 导出 bookSources.json
+        steps.append(cmd_raw("06_pool.py", "commit", run_id))  # 并入池 + 导出
     else:
         steps.append(cmd("05_export.py"))                 # 旧模式：仅导出本轮精选
     if "--limit" in sys.argv:
