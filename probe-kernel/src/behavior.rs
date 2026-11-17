@@ -4,9 +4,11 @@
 //! 设计要点（对齐方案 §7.2 威胁模型）：
 //! - 唯一埋点：java.* 兼容层的所有危险能力都从 parser/js.rs 过，在那里调用本模块的 record()。
 //! - 结构化：每条带 api / url / method / body_len / source_id，可回放（evidence）。
-//! - 进程级累积、按需取走：一次探测结束后 take() 清空，避免跨源串台。
+//! - 线程级累积、按需取走：一次探测结束后 take() 清空，避免跨源串台。
+//!   用 thread_local 而非全局 Mutex：并发探测时每个源一个线程，事件必须隔离，
+//!   否则 A 源的 java.* 会被算到 B 源头上（L4 判定串味）。
 //! - 零 I/O：只写内存，落盘/上报由 main 决定，避免观测本身引入副作用。
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 一条行为事件。
@@ -37,14 +39,12 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-static EVENTS: Mutex<Option<Vec<BehaviorEvent>>> = Mutex::new(None);
+thread_local! {
+    static EVENTS: RefCell<Vec<BehaviorEvent>> = const { RefCell::new(Vec::new()) };
+}
 
 fn with_events<T>(f: impl FnOnce(&mut Vec<BehaviorEvent>) -> T) -> T {
-    let mut guard = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(Vec::new());
-    }
-    f(guard.as_mut().unwrap())
+    EVENTS.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 /// 由 java.* 兼容层调用：记录一次危险能力触发。
@@ -68,14 +68,12 @@ pub fn record(
 
 /// 开始一轮观测（清空上一轮残留）。每个书源探测前调用。
 pub fn begin() {
-    let mut guard = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(Vec::new());
+    EVENTS.with(|cell| cell.borrow_mut().clear());
 }
 
 /// 取走并清空当前所有事件。探测结束后调用。
 pub fn take() -> Vec<BehaviorEvent> {
-    let mut guard = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
-    guard.take().unwrap_or_default()
+    EVENTS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// 基于方案 §7.3 L4 规则的行为判定。
