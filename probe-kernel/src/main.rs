@@ -9,11 +9,15 @@
 //!   --min-chapters N       目录可读章节阈值，默认 3
 //!   --min-content-chars N  正文字数阈值，默认 500
 //!   --min-books-pass N     PASSED 门槛：至少 N 本书跑通四步，默认 1
+//!   --min-head-rate F      头部门槛：classic+hot 四步全过比例下限，默认 0.3（见 §17.1 B-2）
 //!   --host-whitelist h1,h2 允许跨域的目标主机
 //!
 //! 判定口径（方案 §17.1）：
 //!   - 命中 = RuleEngine 从响应解析出真实结构化条目，不是字符串包含
-//!   - 单本命中要求四步严格全过；源 PASSED = 至少 min_books_pass 本四步全过
+//!   - 单本命中要求四步严格全过；源 PASSED = 头部门槛达标 + 至少 min_books_pass 本四步全过
+//!   - 头部层用于排除坏源（非小说站凑出 1 本时头部命中率极低 → PARTIAL）；
+//!     长尾命中率是「书全」主指标，交给 04_select 算边际，不混进 PASSED 门禁
+//!   - 正文步拦验证页 / 图片章 / 空章（§17.1 A-1、B-4）
 //!   - 搜索层挂掉的源整源短路；覆盖度由 hit_* 单独统计（供 04_select 算边际）
 //!   - java.* 调用由 behavior 观测，risk_level 取静态与 L4 更严者
 //!
@@ -77,6 +81,11 @@ struct ProbeBooks {
 
 #[derive(Debug, Deserialize, Clone)]
 struct SourceRec {
+    /// 透传 Python 侧的 source_id（sha256(normalize_url)[:16]）。
+    /// 06_pool 按 source_id 把 matrix 关联回 targets，两边算法不同，必须透传，
+    /// 否则新源一律 by_id 查不到、池永远填不满。纯书源数组输入时此项为空，回退到自算。
+    #[serde(default)]
+    source_id: String,
     #[serde(default)]
     content_hash: String,
     source: BookSource,
@@ -122,10 +131,15 @@ struct ProbeResult {
     fail_stage: String,
     respond_time_ms: u64,
     probe_count: u32,
+    // Python 04_select / 06_pool 读的是驼峰字段名，Rust 内部惯用下划线，这里两者都输出。
+    #[serde(rename = "bookSourceName")]
+    book_source_name_camel: String,
     hit_classic: f64,
     hit_hot: f64,
     hit_waist: f64,
     hit_longtail: f64,
+    /// 方案 §17.1 B-2 门禁：头部命中率是否达标（供诊断 PARTIAL 原因）。
+    head_gate_ok: bool,
     hits: HashMap<String, u32>,
     attempts: HashMap<String, u32>,
     hit_titles: Vec<String>,
@@ -146,6 +160,10 @@ struct Config {
     /// PASSED 门槛：至少 N 本探针书完整跑通四步。默认 1（证明链路真实可用即合格；
     /// 覆盖度由 hit_* 单独统计，不混进 PASSED 判定）。想更严可上调。
     min_books_pass: u32,
+    /// 方案 §17.1 B-2：头部（classic+hot）四步全过命中率下限，用于排除坏源。
+    /// 默认 0.3 —— 头部 20 本要求至少 6 本真跑通，非小说站/凑结构的站过不了。
+    /// 设为 0 则关闭该门禁（退回旧行为）。
+    min_head_rate: f64,
     host_whitelist: Vec<String>,
 }
 
@@ -157,6 +175,7 @@ impl Default for Config {
             min_chapters: 3,
             min_content_chars: 500,
             min_books_pass: 1,
+            min_head_rate: 0.3,
             host_whitelist: Vec::new(),
         }
     }
@@ -229,6 +248,28 @@ fn name_match(actual: &str, expected: &str) -> bool {
 fn looks_blocked(text: &str) -> bool {
     let lower = text.to_lowercase();
     ["tcaptcha", "turing.captcha", "验证码", "captcha"].iter().any(|p| lower.contains(p))
+}
+
+/// 方案 §17.1 B-4：图片章识别。HTTP 200 且有字数，但正文几乎全靠图片撑起来
+/// （漫画扫描页 / 课程页配图），解析出的可读文字远少于图片数 —— 不算有效正文。
+/// 用「原始 HTML 的图片标签数」与「解析正文里的非空白非 ASCII 可读字数」比对，保守判定。
+fn looks_image_only_chapter(raw_body: &str, content: &str) -> Option<String> {
+    let readable = content.chars().filter(|c| !c.is_ascii() && !c.is_whitespace()).count();
+    let img_raw = {
+        let low = raw_body.to_lowercase();
+        low.matches("<img").count() + low.matches("<image").count()
+    };
+    if img_raw >= 3 && readable * 3 < img_raw {
+        return Some(format!("img={},readable={}", img_raw, readable));
+    }
+    let img_in_content = {
+        let low = content.to_lowercase();
+        low.matches("<img").count() + low.matches("<image").count()
+    };
+    if img_in_content >= 3 && readable * 3 < img_in_content {
+        return Some(format!("placeholder_img={},readable={}", img_in_content, readable));
+    }
+    None
 }
 
 /// 用书源的 HTTP 上下文包住同步 JS 解析；拿不到上下文时降级为直接解析。
@@ -394,6 +435,11 @@ fn run_four_steps_with_http(
         Ok(r) => r,
         Err(e) => { steps.insert("content".into(), e); return (steps, false, total_ms); }
     };
+    // §17.1 A-1：HTTP 200 但返回验证页不算通过。
+    if looks_blocked(&cresp.body) {
+        steps.insert("content".into(), fail_step("CONTENT_BLOCKED", 0, "captcha"));
+        return (steps, false, total_ms);
+    }
     let content = pjs::with_book_context(Some(pjs::JsBookContext {
         book: serde_json::json!({"bookUrl": detail_url, "tocUrl": toc_url}),
         chapter: serde_json::json!({"title": readable[0].title, "url": chapter_url}),
@@ -401,6 +447,11 @@ fn run_four_steps_with_http(
     let chars = content.chars().filter(|c| !c.is_whitespace()).count();
     if chars < cfg.min_content_chars {
         steps.insert("content".into(), fail_step("CONTENT_PARSE", 0, &format!("too_short:{}", chars)));
+        return (steps, false, total_ms);
+    }
+    // §17.1 B-4：图片章/空壳正文不算通过。
+    if let Some(why) = looks_image_only_chapter(&cresp.body, &content) {
+        steps.insert("content".into(), fail_step("CONTENT_IMAGE_ONLY", 0, &why));
         return (steps, false, total_ms);
     }
     steps.insert("content".into(), StepResult { ok: true, ms: Some(cf.ms), chars: Some(chars), ..StepResult::default() });
@@ -441,6 +492,8 @@ fn probe_source(
     let url = source.book_source_url.clone();
     let host = host_of(&url);
     let kw = source.check_keyword();
+    // 优先用 Python 侧透传的 source_id（保证与 targets.jsonl 关联）；无则自算。
+    let sid = if rec.source_id.trim().is_empty() { source_id(&url) } else { rec.source_id.clone() };
 
     behavior::begin();
     // 跨平台 JS 持久化目录（Windows 本机调试 / Linux CI 通用），用完即弃。
@@ -508,9 +561,19 @@ fn probe_source(
     let hit_waist = tier_rate("waist", books.waist.len());
     let hit_longtail = tier_rate("longtail", books.longtail.len());
     let chain_ok = n_hit >= cfg.min_books_pass;
+    // 方案 §17.1 B-2：头部层（classic+hot）用于排除坏源。
+    // 头部门禁 = 头部四步全过的书数 / 头部书总数 >= min_head_rate。
+    // 长尾命中率仍是「书全」主指标，交给 04_select 算边际，不参与 PASSED 门禁。
+    let head_total = books.classic.len() + books.hot.len();
+    let head_pass = hits.get("classic").copied().unwrap_or(0)
+        + hits.get("hot").copied().unwrap_or(0);
+    let head_rate = if head_total == 0 { 0.0 } else {
+        (head_pass as f64 / head_total as f64 * 1000.0).round() / 1000.0
+    };
+    let head_gate_ok = head_rate >= cfg.min_head_rate;
     let status = if !gate_ok {
         gate_status.to_string()
-    } else if chain_ok {
+    } else if chain_ok && head_gate_ok {
         "PASSED".into()
     } else {
         "PARTIAL".into()
@@ -523,7 +586,7 @@ fn probe_source(
     if level == "clean" && status == "PARTIAL" { level = "suspicious".into(); }
 
     ProbeResult {
-        source_id: source_id(&url),
+        source_id: sid,
         domain: host,
         book_source_name: source.book_source_name.clone(),
         content_hash: rec.content_hash.clone(),
@@ -533,13 +596,23 @@ fn probe_source(
         search_ok: gate_ok,
         search_status: gate_status.to_string(),
         search_detail: if gate_ok { "gate_ok".into() } else { gate.err.clone().unwrap_or_else(|| "gate_no_items".into()) },
-        fail_stage: if gate_ok { String::new() } else { format!("SEARCH:{}", gate_status) },
+        fail_stage: if !gate_ok {
+            format!("SEARCH:{}", gate_status)
+        } else if !head_gate_ok {
+            format!("HEAD_GATE:head_rate={}<{}", head_rate, cfg.min_head_rate)
+        } else if !chain_ok {
+            format!("CHAIN:n_hit={}<{}", n_hit, cfg.min_books_pass)
+        } else {
+            String::new()
+        },
         respond_time_ms: if probe_count > 0 { total_ms / probe_count as u64 } else { 0 },
         probe_count,
+        book_source_name_camel: source.book_source_name.clone(),
         hit_classic,
         hit_hot,
         hit_waist,
         hit_longtail,
+        head_gate_ok,
         hits,
         attempts,
         hit_titles,
@@ -557,7 +630,7 @@ fn probe_source(
 fn parse_args() -> (String, String, String, Config) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--host-whitelist h1,h2]");
+        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-rate F] [--host-whitelist h1,h2]");
         std::process::exit(2);
     }
     let mut cfg = Config::default();
@@ -571,6 +644,7 @@ fn parse_args() -> (String, String, String, Config) {
             "--min-chapters" => cfg.min_chapters = val.parse().unwrap_or(3),
             "--min-content-chars" => cfg.min_content_chars = val.parse().unwrap_or(500),
             "--min-books-pass" => cfg.min_books_pass = val.parse().unwrap_or(1),
+            "--min-head-rate" => cfg.min_head_rate = val.parse().unwrap_or(0.3),
             "--host-whitelist" => cfg.host_whitelist = val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
             _ => {}
         }
@@ -588,6 +662,7 @@ fn main() {
         Err(_) => {
             let arr: Vec<BookSource> = serde_json::from_str(&raw).expect("解析书源数组失败");
             arr.into_iter().map(|s| SourceRec {
+                source_id: String::new(),
                 content_hash: content_hash(&s),
                 source: s,
             }).collect()
@@ -595,9 +670,9 @@ fn main() {
     };
     let books_raw = fs::read_to_string(&books_path).expect("读取 probe_books.json 失败");
     let books: ProbeBooks = serde_json::from_str(&books_raw).expect("解析探针书单失败");
-    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={}",
+    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={} 门禁头部率>={}至少{}本",
         recs.len(), books.classic.len(), books.hot.len(), books.waist.len(), books.longtail.len(),
-        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars);
+        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_head_rate, cfg.min_books_pass);
 
     let http = Arc::new(HttpClient::new(cfg.timeout_secs, None).expect("初始化 HTTP 客户端失败"));
     let parser = Arc::new(RuleEngine::new().expect("初始化 RuleEngine 失败"));

@@ -151,10 +151,14 @@ def _row_ok(r):
 def _merge_new(st, rows, by_id, size):
     """fill 模式：把合格且不在池的新源并入，直到池满。返回新入池数。"""
     added = 0
-    # 按书全命中率 + 响应快优先
+    # 书全评分（§17.1 B-2）：长尾主指标 > 腰部 > 头部，其次响应快。
+    def fullness(r):
+        return (r.get("hit_longtail") or 0, r.get("hit_waist") or 0,
+                (r.get("hit_classic") or 0) + (r.get("hit_hot") or 0))
+
     ranked = sorted([r for r in rows if _row_ok(r)],
-                    key=lambda r: ((r.get("hit_classic") or 0) + (r.get("hit_hot") or 0),
-                                   -(r.get("respond_time_ms") or 99999)), reverse=True)
+                    key=lambda r: (fullness(r), -(r.get("respond_time_ms") or 99999)),
+                    reverse=True)
     cur_ids = {p["source_id"] for p in st["pool"]}
     for r in ranked:
         if len(st["pool"]) >= size:
@@ -174,6 +178,8 @@ def _merge_new(st, rows, by_id, size):
             "history": [{"round": st["round"], "at": _now(),
                          "status": r.get("status"), "search_ok": True,
                          "hit_classic": r.get("hit_classic"), "hit_hot": r.get("hit_hot"),
+                         "hit_waist": r.get("hit_waist"), "hit_longtail": r.get("hit_longtail"),
+                         "steps_ok": r.get("steps_ok"),
                          "respond_time_ms": r.get("respond_time_ms")}],
         })
         cur_ids.add(sid)
@@ -197,6 +203,8 @@ def _recheck(st, rows, fail_limit, blocked_limit):
             "round": st["round"], "at": _now(), "status": status,
             "search_ok": r.get("search_ok"),
             "hit_classic": r.get("hit_classic"), "hit_hot": r.get("hit_hot"),
+            "hit_waist": r.get("hit_waist"), "hit_longtail": r.get("hit_longtail"),
+            "steps_ok": r.get("steps_ok"),
             "respond_time_ms": r.get("respond_time_ms"),
         })
         p["history"] = p["history"][-10:]  # 只留最近 10 次

@@ -49,16 +49,69 @@ jobs:
         # 采集：按合集访问量取前 8 个，不做 3 万条全量；限速 0.8s/请求
         run: python3 scripts/collect_yiove.py ci --collections 8 --pages 1
 
-      - name: Normalize, probe and select
-        # 探测 50 个候选（约 7 分钟）；checkKeyWord 判连接 + 5经典5热门交叉验证
+      - name: Download probe-kernel binary
+        # Rust 四步探测内核（方案 §17.1）：搜索→详情→目录→正文真跑通 + L4 行为观测。
+        # 二进制由 build-probe-kernel（仅手动触发）预编译发布到 release tag=probe-kernel。
+        # 这里只下载现成二进制执行，不在 daily 里现编译（避免每轮 10+ 分钟冷编译）。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
+          mkdir -p bin
+          gh release download probe-kernel --repo "$GITHUB_REPOSITORY" \
+            --pattern 'probe-kernel-linux-x64.tar.gz' --dir bin --clobber
+          tar xzf bin/probe-kernel-linux-x64.tar.gz -C bin
+          chmod +x bin/probe-kernel
+          ./bin/probe-kernel 2>&1 | head -3 || true
+          echo "probe-kernel ready"
+
+      - name: Normalize, plan pool, prepare Rust probe input
+        # 只跑到 06_pool plan：产出 targets.jsonl（本轮要探的源）。
+        # 再把 targets.jsonl 转成 Rust CLI 输入（透传 source_id/content_hash，保证能关联回池）。
+        run: |
+          set -e
           SNAP=runs/ci/sources_snapshot.json
           if [ ! -s "$SNAP" ]; then
             echo "::error::采集失败：sources_snapshot.json 不存在或为空"
             exit 2
           fi
-          # --pool 必须带：否则不调用 06_pool 的 plan/commit，artifact 传来的池状态无人读写
-          python3 scripts/run_pipeline.py "$SNAP" --run-id ci --pool --limit 50 --stop 0.02
+          python3 scripts/01_fetch_probe_books.py ci
+          python3 scripts/02_normalize.py "$SNAP" ci
+          python3 scripts/06_pool.py plan ci --size 50
+          python3 scripts/make_probe_input.py ci
+          echo "targets=$(wc -l < runs/ci/targets.jsonl) rust_input=$(wc -l < runs/ci/probe_input.jsonl)"
+
+      - name: Probe (Rust four-step CLI)
+        # 四步真探测替代旧 Python 搜索层命中。head 门禁默认 0.3（§17.1 B-2）。
+        # 输出 matrix.jsonl 直接喂 04_select / 06_pool commit。
+        run: |
+          set -e
+          ./bin/probe-kernel \
+            runs/ci/probe_input.jsonl \
+            runs/ci/probe_books.json \
+            runs/ci/matrix.jsonl \
+            --concurrency 4 --timeout-secs 12 \
+            --min-chapters 3 --min-content-chars 500 \
+            --min-books-pass 1 --min-head-rate 0.3
+          python3 - <<'PY'
+          import json, collections
+          rows = [json.loads(l) for l in open('runs/ci/matrix.jsonl', encoding='utf-8') if l.strip()]
+          print('探测源数:', len(rows))
+          print('status:', dict(collections.Counter(r.get('status') for r in rows)))
+          print('PASSED 明细:')
+          for r in rows:
+            if r.get('status') == 'PASSED':
+              print('  %-20s 长尾=%s 腰部=%s 头部=%s/%s steps=%s risk=%s' % (
+                str(r.get('bookSourceName'))[:20], r.get('hit_longtail'), r.get('hit_waist'),
+                r.get('hit_classic'), r.get('hit_hot'), r.get('steps_ok'), r.get('risk_level')))
+          PY
+
+      - name: Select and commit pool
+        # 04_select 出本轮参考白名单；06_pool commit 把 PASSED 源并入池并导出 bookSources.json。
+        run: |
+          set -e
+          python3 scripts/04_select.py ci --stop 0.02
+          python3 scripts/06_pool.py commit ci --fail 2 --blocked 3
 
       - name: Publish summary
         run: |
