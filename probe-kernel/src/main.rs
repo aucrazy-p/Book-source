@@ -437,7 +437,10 @@ fn probe_source(
     let kw = source.check_keyword();
 
     behavior::begin();
-    pjs::set_js_storage_dir(std::path::PathBuf::from("/tmp/probe-js-store"));
+    // 跨平台 JS 持久化目录（Windows 本机调试 / Linux CI 通用），用完即弃。
+    let js_dir = std::env::temp_dir().join("probe-js-store");
+    let _ = std::fs::create_dir_all(&js_dir);
+    pjs::set_js_storage_dir(js_dir);
 
     // 整源短路：先用 checkKeyWord 跑一次搜索，解析不出结果就跳过 10 本书。
     let gate = fetch_step(http, rt, source, source.search_url.as_deref().unwrap_or(""), &kw, &url);

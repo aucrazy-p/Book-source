@@ -38,6 +38,35 @@ jobs:
         # 跑 behavior 判定单测，验证 L4 hook 逻辑（不联网）
         run: cargo test --release --manifest-path probe-kernel/Cargo.toml behavior::tests -- --nocapture
 
+      - name: Smoke test (four-step probe)
+        # 用刚编译的二进制对线上 9 源跑一次四步探测（联网），验证 CLI 运行期正确。
+        # 输入是纯 Legado 数组，CLI 自动兼容。只验证、不发布，不碰 daily.yml。
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          probe-kernel/target/release/probe-kernel \
+            docs/sources.json conf/probe_books.json smoke.jsonl \
+            --concurrency 4 --timeout-secs 12
+          echo "=== 冒烟结果汇总 ==="
+          python3 - <<'PY'
+          import json, collections
+          rows = [json.loads(l) for l in open('smoke.jsonl', encoding='utf-8') if l.strip()]
+          print('探测源数:', len(rows))
+          print('status 分布:', dict(collections.Counter(r.get('status') for r in rows)))
+          for r in rows:
+            print('  %-22s status=%-8s steps_ok=%s hits=%s risk=%s' % (
+              str(r.get('book_source_name'))[:22], r.get('status'),
+              r.get('steps_ok'), r.get('hits'), r.get('risk_level')))
+          PY
+
+      - name: Upload smoke artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-smoke
+          path: smoke.jsonl
+          if-no-files-found: ignore
+
       - name: Package
         run: |
           mkdir -p dist
