@@ -120,7 +120,20 @@ def plan(run_id, size):
             if sid not in pool_ids and sid not in retired:
                 picked.append(r)
             i += 1
-        targets = picked
+        # 池内源一并纳入本轮复测（不占 50 新候选名额）。否则 fill 模式下池内源
+        # 永不重测：变坏的源（如 L4 后来观测到 java.* 危险调用、或搜索失效）无法
+        # 被 commit 的二次安全过滤发现，池会缓慢腐化。复测结果的 risk 会写进
+        # matrix，由二次过滤清出并记入 retired。
+        for p in st["pool"]:
+            sid = p["source_id"]
+            if sid in {t["source_id"] for t in targets} or sid in st["retired"]:
+                continue
+            targets.append({
+                "source_id": sid, "domain": p.get("domain", ""),
+                "bookSourceName": p.get("bookSourceName", ""),
+                "content_hash": p.get("content_hash", ""),
+                "risk_level": "clean", "source": p["source"],
+            })
         st["cursor"] = i  # 推进游标，即使没选够也跳过扫描过的
     else:
         mode = "recheck"
@@ -145,7 +158,10 @@ def plan(run_id, size):
 
 
 def _row_ok(r):
-    return r.get("search_ok") is True and r.get("status") == "PASSED"
+    # 与 04_select 同口径：只有 clean 源能进池/算合格。
+    # quarantine（L4 观测到 java.* 危险调用）/suspicious 一律不许入池。
+    return (r.get("search_ok") is True and r.get("status") == "PASSED"
+            and r.get("risk_level") == "clean")
 
 
 def _merge_new(st, rows, by_id, size):
@@ -255,26 +271,35 @@ def commit(run_id, fail_limit, blocked_limit):
             print("[池]   淘汰 %-20s (%s)" % (str(name)[:20], reason))
         print("[池] recheck：淘汰 %d 个，池内剩 %d" % (removed, len(st["pool"])))
 
-    # 导出前二次成人过滤：源头 02_normalize 已筛过新候选，但池内可能残留
-    # 旧规则漏网的源（如新变体域名）。这里再拦一道，命中即移出池并记入 retired。
+    # 导出前二次安全过滤：源头 02_normalize 已筛过新候选，但池内可能残留
+    # 旧规则漏网的源（成人新变体域名），或历史版本放过的高低风险源。
+    # 命中即移出池并记入 retired，确保 docs/sources.json 只含 clean 源。
+    # 风险来源：matrix 的 risk_level（L4 行为观测）写回池内 history，取最近一次。
     is_adult, n_rules = _adult_blocker()
+    risk_by_id = {r["source_id"]: r.get("risk_level") for r in rows}
     kept = []
-    adult_removed = []
+    safety_removed = []
     for p in st["pool"]:
         hit, ev = is_adult(p.get("source", {}))
         if hit:
+            reason = "adult_filter:" + ev
+        else:
+            # 只在本轮测到该源且有明确非 clean 判定时才移出；本轮没测到的保留不动。
+            risk = risk_by_id.get(p["source_id"])
+            reason = ("risk_filter:" + str(risk)) if risk is not None and risk != "clean" else None
+        if reason:
             st["retired"][p["source_id"]] = {
-                "reason": "adult_filter:" + ev, "name": p.get("bookSourceName"),
+                "reason": reason, "name": p.get("bookSourceName"),
                 "domain": p.get("domain"), "at": _now(), "round": st["round"]}
-            adult_removed.append((p.get("bookSourceName"), ev))
+            safety_removed.append((p.get("bookSourceName"), reason))
         else:
             kept.append(p)
-    if adult_removed:
+    if safety_removed:
         st["pool"] = kept
-        for name, ev in adult_removed:
-            print("[池]   成人过滤移出 %s (%s)" % (name, ev))
-        print("[池] 二次成人过滤：移出 %d 个（规则 %d 条），池内剩 %d"
-              % (len(adult_removed), n_rules, len(st["pool"])))
+        for name, reason in safety_removed:
+            print("[池]   安全过滤移出 %s (%s)" % (name, reason))
+        print("[池] 二次安全过滤：移出 %d 个（成人规则 %d 条），池内剩 %d"
+              % (len(safety_removed), n_rules, len(st["pool"])))
 
     save_state(st)
 
