@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::sync::{Arc, Mutex, Semaphore};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------- 输入
@@ -41,7 +41,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone)]
 struct ProbeBook {
     title: String,
-    #[serde(default)]
     author: String,
 }
 
@@ -177,7 +176,7 @@ fn content_hash(source: &BookSource) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.book_source_url.hash(&mut h);
-    source.rule_search.hash(&mut h);
+    format!("{:?}", source.rule_search).hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -274,12 +273,29 @@ fn fail_step(stage: &str, ms: u64, detail: &str) -> StepResult {
     StepResult { ok: false, ms: Some(ms), stage: Some(format!("{}:{}", stage, detail)), ..StepResult::default() }
 }
 
-fn resp_or_fail(f: StepFetch, prefix: &str) -> Result<FetchResponse, StepResult> {
-    match (f.resp, f.err) {
-        (Some(r), _) if r.status == 403 || r.status == 429 => Err(fail_step(&format!("{}_BLOCKED", prefix), f.ms, &format!("http_{}", r.status))),
+// stable Rust 无 std::sync::Semaphore（nightly-only），用有界 channel 实现并发闸门。
+// 预填 N 个 token，取到者为 Permit，Drop 时归还。
+struct Permit {
+    _token: (),
+    tx: mpsc::Sender<()>,
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let _ = self.tx.send(());
+    }
+}
+fn acquire_permit(rx: &Arc<Mutex<mpsc::Receiver<()>>>, tx: &mpsc::Sender<()>) -> Permit {
+    let token = rx.lock().unwrap().recv().expect("semaphore channel 关闭");
+    Permit { _token: token, tx: tx.clone() }
+}
+
+fn resp_or_fail(f: &mut StepFetch, prefix: &str) -> Result<FetchResponse, StepResult> {
+    let ms = f.ms;
+    match (f.resp.take(), f.err.take()) {
+        (Some(r), _) if r.status == 403 || r.status == 429 => Err(fail_step(&format!("{}_BLOCKED", prefix), ms, &format!("http_{}", r.status))),
         (Some(r), _) => Ok(r),
-        (None, Some(e)) => Err(fail_step(&format!("{}_FETCH", prefix), f.ms, &e)),
-        (None, None) => Err(fail_step(&format!("{}_FETCH", prefix), f.ms, "empty")),
+        (None, Some(e)) => Err(fail_step(&format!("{}_FETCH", prefix), ms, &e)),
+        (None, None) => Err(fail_step(&format!("{}_FETCH", prefix), ms, "empty")),
     }
 }
 
@@ -288,7 +304,7 @@ fn resp_or_fail(f: StepFetch, prefix: &str) -> Result<FetchResponse, StepResult>
 fn run_four_steps_with_http(
     source: &BookSource,
     book: &ProbeBook,
-    sf: StepFetch,
+    mut sf: StepFetch,
     http: &HttpClient,
     rt: &tokio::runtime::Handle,
     parser: &RuleEngine,
@@ -298,7 +314,7 @@ fn run_four_steps_with_http(
     let mut total_ms = sf.ms;
 
     // ---- 1) search ----
-    let resp = match resp_or_fail(sf, "SEARCH") {
+    let resp = match resp_or_fail(&mut sf, "SEARCH") {
         Ok(r) => r,
         Err(e) => { steps.insert("search".into(), e); return (steps, false, total_ms); }
     };
@@ -324,9 +340,9 @@ fn run_four_steps_with_http(
         steps.insert("detail".into(), fail_step("DETAIL_URL", 0, "empty_book_url"));
         return (steps, false, total_ms);
     }
-    let df = fetch_step(http, rt, source, &detail_url, "", &source.book_source_url);
+    let mut df = fetch_step(http, rt, source, &detail_url, "", &source.book_source_url);
     total_ms += df.ms;
-    let dresp = match resp_or_fail(df, "DETAIL") {
+    let dresp = match resp_or_fail(&mut df, "DETAIL") {
         Ok(r) => r,
         Err(e) => { steps.insert("detail".into(), e); return (steps, false, total_ms); }
     };
@@ -345,9 +361,9 @@ fn run_four_steps_with_http(
         Some(t) if !t.trim().is_empty() => resolve_url_for_test(&dresp.url, t),
         _ => detail_url.clone(),
     };
-    let tf = fetch_step(http, rt, source, &toc_url, "", &source.book_source_url);
+    let mut tf = fetch_step(http, rt, source, &toc_url, "", &source.book_source_url);
     total_ms += tf.ms;
-    let tresp = match resp_or_fail(tf, "TOC") {
+    let tresp = match resp_or_fail(&mut tf, "TOC") {
         Ok(r) => r,
         Err(e) => { steps.insert("toc".into(), e); return (steps, false, total_ms); }
     };
@@ -366,9 +382,9 @@ fn run_four_steps_with_http(
 
     // ---- 4) content ----
     let chapter_url = resolve_url_for_test(&tresp.url, &readable[0].url);
-    let cf = fetch_step(http, rt, source, &chapter_url, "", &source.book_source_url);
+    let mut cf = fetch_step(http, rt, source, &chapter_url, "", &source.book_source_url);
     total_ms += cf.ms;
-    let cresp = match resp_or_fail(cf, "CONTENT") {
+    let cresp = match resp_or_fail(&mut cf, "CONTENT") {
         Ok(r) => r,
         Err(e) => { steps.insert("content".into(), e); return (steps, false, total_ms); }
     };
@@ -569,7 +585,11 @@ fn main() {
     let http = Arc::new(HttpClient::new(cfg.timeout_secs, None).expect("初始化 HTTP 客户端失败"));
     let parser = Arc::new(RuleEngine::new().expect("初始化 RuleEngine 失败"));
     let out = Arc::new(Mutex::new(fs::File::create(&out_path).expect("创建输出失败")));
-    let sem = Arc::new(Semaphore::new(cfg.concurrency));
+    let (sem_tx, sem_rx) = mpsc::channel::<()>();
+    for _ in 0..cfg.concurrency.max(1) {
+        let _ = sem_tx.send(());
+    }
+    let sem_rx = Arc::new(Mutex::new(sem_rx));
     let cfg = Arc::new(cfg);
     let books = Arc::new(books);
 
@@ -582,7 +602,8 @@ fn main() {
 
     let mut handles = Vec::new();
     for rec in recs {
-        let sem = sem.clone();
+        let sem_rx = sem_rx.clone();
+        let sem_tx = sem_tx.clone();
         let http = http.clone();
         let parser = parser.clone();
         let out = out.clone();
@@ -590,7 +611,7 @@ fn main() {
         let books = books.clone();
         let handle = handle.clone();
         handles.push(std::thread::spawn(move || {
-            let _permit = sem.acquire().expect("semaphore 关闭");
+            let _permit = acquire_permit(&sem_rx, &sem_tx);
             let result = probe_source(&rec, &books, &http, &handle, &parser, &cfg);
             let line = serde_json::to_string(&result).expect("序列化结果失败");
             let mut f = out.lock().expect("输出锁被污染");
