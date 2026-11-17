@@ -69,6 +69,10 @@ struct ProbeBooks {
     classic: Vec<ProbeBook>,
     #[serde(default)]
     hot: Vec<ProbeBook>,
+    #[serde(default)]
+    waist: Vec<ProbeBook>,
+    #[serde(default)]
+    longtail: Vec<ProbeBook>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -120,6 +124,8 @@ struct ProbeResult {
     probe_count: u32,
     hit_classic: f64,
     hit_hot: f64,
+    hit_waist: f64,
+    hit_longtail: f64,
     hits: HashMap<String, u32>,
     attempts: HashMap<String, u32>,
     hit_titles: Vec<String>,
@@ -471,6 +477,8 @@ fn probe_source(
         let mut tier_books: Vec<(&str, &ProbeBook)> = Vec::new();
         for b in &books.classic { tier_books.push(("classic", b)); }
         for b in &books.hot { tier_books.push(("hot", b)); }
+        for b in &books.waist { tier_books.push(("waist", b)); }
+        for b in &books.longtail { tier_books.push(("longtail", b)); }
         for (tier, b) in tier_books {
             *attempts.entry(tier.to_string()).or_insert(0) += 1;
             probe_count += 1;
@@ -490,12 +498,15 @@ fn probe_source(
     }
 
     let n_hit = hits.values().copied().sum::<u32>();
-    let hit_classic = if books.classic.is_empty() { 0.0 } else {
-        (hits.get("classic").copied().unwrap_or(0) as f64 / books.classic.len() as f64 * 1000.0).round() / 1000.0
+    let tier_rate = |tier: &str, total: usize| -> f64 {
+        if total == 0 { 0.0 } else {
+            (hits.get(tier).copied().unwrap_or(0) as f64 / total as f64 * 1000.0).round() / 1000.0
+        }
     };
-    let hit_hot = if books.hot.is_empty() { 0.0 } else {
-        (hits.get("hot").copied().unwrap_or(0) as f64 / books.hot.len() as f64 * 1000.0).round() / 1000.0
-    };
+    let hit_classic = tier_rate("classic", books.classic.len());
+    let hit_hot = tier_rate("hot", books.hot.len());
+    let hit_waist = tier_rate("waist", books.waist.len());
+    let hit_longtail = tier_rate("longtail", books.longtail.len());
     let chain_ok = n_hit >= cfg.min_books_pass;
     let status = if !gate_ok {
         gate_status.to_string()
@@ -527,6 +538,8 @@ fn probe_source(
         probe_count,
         hit_classic,
         hit_hot,
+        hit_waist,
+        hit_longtail,
         hits,
         attempts,
         hit_titles,
@@ -582,8 +595,9 @@ fn main() {
     };
     let books_raw = fs::read_to_string(&books_path).expect("读取 probe_books.json 失败");
     let books: ProbeBooks = serde_json::from_str(&books_raw).expect("解析探针书单失败");
-    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{} 并发={} 阈值章节>={}正文>={}",
-        recs.len(), books.classic.len(), books.hot.len(), cfg.concurrency, cfg.min_chapters, cfg.min_content_chars);
+    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={}",
+        recs.len(), books.classic.len(), books.hot.len(), books.waist.len(), books.longtail.len(),
+        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars);
 
     let http = Arc::new(HttpClient::new(cfg.timeout_secs, None).expect("初始化 HTTP 客户端失败"));
     let parser = Arc::new(RuleEngine::new().expect("初始化 RuleEngine 失败"));

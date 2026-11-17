@@ -42,7 +42,7 @@ jobs:
         # 用刚编译的二进制对线上 9 源跑一次四步探测（联网），验证 CLI 运行期正确。
         # 输入是纯 Legado 数组，CLI 自动兼容。只验证、不发布，不碰 daily.yml。
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           probe-kernel/target/release/probe-kernel \
             docs/sources.json conf/probe_books.json smoke.jsonl \
