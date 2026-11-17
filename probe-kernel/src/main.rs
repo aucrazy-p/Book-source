@@ -9,7 +9,7 @@
 //!   --min-chapters N       目录可读章节阈值，默认 3
 //!   --min-content-chars N  正文字数阈值，默认 500
 //!   --min-books-pass N     PASSED 门槛：至少 N 本书跑通四步，默认 1
-//!   --min-head-rate F      头部门槛：classic+hot 四步全过比例下限，默认 0.3（见 §17.1 B-2）
+//!   --min-head-books N     头部门槛：classic+hot 至少 N 本四步全过，默认 1（见 §17.1 B-2）
 //!   --host-whitelist h1,h2 允许跨域的目标主机
 //!
 //! 判定口径（方案 §17.1）：
@@ -160,10 +160,11 @@ struct Config {
     /// PASSED 门槛：至少 N 本探针书完整跑通四步。默认 1（证明链路真实可用即合格；
     /// 覆盖度由 hit_* 单独统计，不混进 PASSED 判定）。想更严可上调。
     min_books_pass: u32,
-    /// 方案 §17.1 B-2：头部（classic+hot）四步全过命中率下限，用于排除坏源。
-    /// 默认 0.3 —— 头部 20 本要求至少 6 本真跑通，非小说站/凑结构的站过不了。
-    /// 设为 0 则关闭该门禁（退回旧行为）。
-    min_head_rate: f64,
+    /// 方案 §17.1 B-2：头部（classic+hot）四步全过的最少本数，用于排除坏源。
+    /// 默认 1 —— 头部 20 本至少 1 本真跑通即可；非小说站/凑结构的站头部命中 0，
+    /// 会被这道门禁挡住。实测用「命中率≥0.3」会误杀真源（机房 IP 下真源头部仅 2~4/20），
+    /// 故按方案原意「头部排除坏源」改为本数门槛。设为 0 关闭。
+    min_head_books: u32,
     host_whitelist: Vec<String>,
 }
 
@@ -175,7 +176,7 @@ impl Default for Config {
             min_chapters: 3,
             min_content_chars: 500,
             min_books_pass: 1,
-            min_head_rate: 0.3,
+            min_head_books: 1,
             host_whitelist: Vec::new(),
         }
     }
@@ -562,15 +563,12 @@ fn probe_source(
     let hit_longtail = tier_rate("longtail", books.longtail.len());
     let chain_ok = n_hit >= cfg.min_books_pass;
     // 方案 §17.1 B-2：头部层（classic+hot）用于排除坏源。
-    // 头部门禁 = 头部四步全过的书数 / 头部书总数 >= min_head_rate。
+    // 头部门禁 = 头部四步全过的本数 >= min_head_books（默认 1）。
+    // 非小说站头部命中 0 → 拦；真源头部普遍 2~4 本 → 过。
     // 长尾命中率仍是「书全」主指标，交给 04_select 算边际，不参与 PASSED 门禁。
-    let head_total = books.classic.len() + books.hot.len();
     let head_pass = hits.get("classic").copied().unwrap_or(0)
         + hits.get("hot").copied().unwrap_or(0);
-    let head_rate = if head_total == 0 { 0.0 } else {
-        (head_pass as f64 / head_total as f64 * 1000.0).round() / 1000.0
-    };
-    let head_gate_ok = head_rate >= cfg.min_head_rate;
+    let head_gate_ok = head_pass >= cfg.min_head_books;
     let status = if !gate_ok {
         gate_status.to_string()
     } else if chain_ok && head_gate_ok {
@@ -582,7 +580,10 @@ fn probe_source(
     let steps_ok = if chain_ok { 4 } else { std::cmp::min(3, n_hit) as u8 };
 
     let events = behavior::take();
-    let (mut level, reasons) = judge_with_timeout(&host, &events, total_ms, cfg);
+    // 方案 §17.1 A-4：respond_time_ms > 5000 降级，用单源平均耗时，
+    // 不是 total_ms（50 本书累计必然超 5s，会把所有源误降 suspicious）。
+    let respond_ms = if probe_count > 0 { total_ms / probe_count as u64 } else { 0 };
+    let (mut level, reasons) = judge_with_timeout(&host, &events, respond_ms, cfg);
     if level == "clean" && status == "PARTIAL" { level = "suspicious".into(); }
 
     ProbeResult {
@@ -599,13 +600,13 @@ fn probe_source(
         fail_stage: if !gate_ok {
             format!("SEARCH:{}", gate_status)
         } else if !head_gate_ok {
-            format!("HEAD_GATE:head_rate={}<{}", head_rate, cfg.min_head_rate)
+            format!("HEAD_GATE:head_pass={}<{}", head_pass, cfg.min_head_books)
         } else if !chain_ok {
             format!("CHAIN:n_hit={}<{}", n_hit, cfg.min_books_pass)
         } else {
             String::new()
         },
-        respond_time_ms: if probe_count > 0 { total_ms / probe_count as u64 } else { 0 },
+        respond_time_ms: respond_ms,
         probe_count,
         book_source_name_camel: source.book_source_name.clone(),
         hit_classic,
@@ -630,7 +631,7 @@ fn probe_source(
 fn parse_args() -> (String, String, String, Config) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-rate F] [--host-whitelist h1,h2]");
+        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2]");
         std::process::exit(2);
     }
     let mut cfg = Config::default();
@@ -644,7 +645,7 @@ fn parse_args() -> (String, String, String, Config) {
             "--min-chapters" => cfg.min_chapters = val.parse().unwrap_or(3),
             "--min-content-chars" => cfg.min_content_chars = val.parse().unwrap_or(500),
             "--min-books-pass" => cfg.min_books_pass = val.parse().unwrap_or(1),
-            "--min-head-rate" => cfg.min_head_rate = val.parse().unwrap_or(0.3),
+            "--min-head-books" => cfg.min_head_books = val.parse().unwrap_or(1),
             "--host-whitelist" => cfg.host_whitelist = val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
             _ => {}
         }
@@ -670,9 +671,9 @@ fn main() {
     };
     let books_raw = fs::read_to_string(&books_path).expect("读取 probe_books.json 失败");
     let books: ProbeBooks = serde_json::from_str(&books_raw).expect("解析探针书单失败");
-    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={} 门禁头部率>={}至少{}本",
+    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={} 门禁头部>={}本 总命中>={}本",
         recs.len(), books.classic.len(), books.hot.len(), books.waist.len(), books.longtail.len(),
-        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_head_rate, cfg.min_books_pass);
+        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_head_books, cfg.min_books_pass);
 
     let http = Arc::new(HttpClient::new(cfg.timeout_secs, None).expect("初始化 HTTP 客户端失败"));
     let parser = Arc::new(RuleEngine::new().expect("初始化 RuleEngine 失败"));

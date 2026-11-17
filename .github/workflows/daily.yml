@@ -82,7 +82,7 @@ jobs:
           echo "targets=$(wc -l < runs/ci/targets.jsonl) rust_input=$(wc -l < runs/ci/probe_input.jsonl)"
 
       - name: Probe (Rust four-step CLI)
-        # 四步真探测替代旧 Python 搜索层命中。head 门禁默认 0.3（§17.1 B-2）。
+        # 四步真探测替代旧 Python 搜索层命中。head 门禁：头部至少 1 本四步全过（§17.1 B-2）。
         # 输出 matrix.jsonl 直接喂 04_select / 06_pool commit。
         run: |
           set -e
@@ -92,7 +92,7 @@ jobs:
             runs/ci/matrix.jsonl \
             --concurrency 4 --timeout-secs 12 \
             --min-chapters 3 --min-content-chars 500 \
-            --min-books-pass 1 --min-head-rate 0.3
+            --min-books-pass 1 --min-head-books 1
           python3 - <<'PY'
           import json, collections
           rows = [json.loads(l) for l in open('runs/ci/matrix.jsonl', encoding='utf-8') if l.strip()]
