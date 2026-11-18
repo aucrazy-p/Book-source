@@ -194,3 +194,31 @@ jobs:
             git push origin HEAD:main
             echo "::notice::已发布 sources.json 到 docs/，Pages 将自动重建"
           fi
+
+      # ---- Actions 记录自动清理：删除 7 天前的 workflow run ----
+      # 保持 Actions 页面整洁（pages-build-deployment 每次 push 都产生一条，堆积快）。
+      # 注意：DELETE run 会连带删除其 artifact，pool-state 每天由最新轮覆盖生成，
+      # 7 天保留期不影响次日恢复。runs 总量每天约 10 条，per_page=100 单页足够。
+      - name: Cleanup workflow runs older than 7 days
+        if: always()
+        run: |
+          set -e
+          CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          echo "清理 UTC $CUTOFF 之前的 run"
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          API="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          IDS=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            "$API/runs?per_page=100" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(' '.join(str(r['id']) for r in d['workflow_runs'] if r['created_at'] < '$CUTOFF'))
+          ")
+          N=0
+          for id in $IDS; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $TOKEN" "$API/runs/$id")
+            if [ "$code" = "204" ]; then N=$((N+1)); else echo "::warning::删除 run $id 返回 $code"; fi
+          done
+          echo "已清理 $N 条 7 天前的 run"
