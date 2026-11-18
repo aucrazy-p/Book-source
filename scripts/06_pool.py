@@ -305,8 +305,13 @@ def commit(run_id, fail_limit, blocked_limit):
         st["pool"] = kept
         for name, reason in safety_removed:
             print("[池]   安全过滤移出 %s (%s)" % (name, reason))
-        print("[池] 二次安全过滤：移出 %d 个（成人规则 %d 条），池内剩 %d"
-              % (len(safety_removed), n_rules, len(st["pool"])))
+        # 分开统计命中原因：成人规则命中的是源，n_rules 只是规则库规模，
+        # 混在一句里容易被误读成"移出 N 个成人源"（历史日志就出现过这个歧义）。
+        n_adult = sum(1 for _, r in safety_removed if r.startswith("adult_filter:"))
+        n_risk = len(safety_removed) - n_adult
+        print("[池] 二次安全过滤：移出 %d 个（成人规则命中 %d 个 / risk 过滤 %d 个；"
+              "规则库 %d 条），池内剩 %d"
+              % (len(safety_removed), n_adult, n_risk, n_rules, len(st["pool"])))
 
     save_state(st)
 
