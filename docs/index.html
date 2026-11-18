@@ -175,11 +175,7 @@
     </div>
 
     <div class="actions">
-      <button class="btn btn-primary" onclick="copyAll()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        一键复制全部书源
-      </button>
-      <button class="btn btn-secondary" onclick="copyNetUrl()">
+      <button class="btn btn-primary" onclick="copyNetUrl()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
         复制网络导入链接
       </button>
@@ -188,7 +184,7 @@
         下载 JSON
       </a>
     </div>
-    <p class="hint">复制后打开「阅读」App → 书源管理 → 右上角 ＋ → 剪贴板导入 / 网络导入</p>
+    <p class="hint">复制链接后打开「阅读」App → 书源管理 → 右上角 ＋ → 网络导入</p>
   </div>
 
   <section>
@@ -215,8 +211,8 @@
   <section>
     <div class="sec-head"><h2>导入指南 <span>三步搞定</span></h2></div>
     <div class="steps">
-      <div class="step"><div class="n">1</div><h3>复制书源</h3><p>点击上方「一键复制全部书源」，或复制网络导入链接，也可直接下载 <code>sources.json</code>。</p></div>
-      <div class="step"><div class="n">2</div><h3>打开阅读 App</h3><p>进入 <code>我的 → 书源管理</code>，点击右上角 <code>＋</code>，选择「剪贴板导入」或「网络导入」。</p></div>
+      <div class="step"><div class="n">1</div><h3>复制导入链接</h3><p>点击上方「复制网络导入链接」，也可直接下载 <code>sources.json</code>。</p></div>
+      <div class="step"><div class="n">2</div><h3>打开阅读 App</h3><p>进入 <code>我的 → 书源管理</code>，点击右上角 <code>＋</code>，选择「网络导入」并粘贴链接。</p></div>
       <div class="step"><div class="n">3</div><h3>搜索阅读</h3><p>粘贴并确认导入后，回到搜索页即可使用。若某源失效，可到源站或本页获取更新。</p></div>
     </div>
   </section>
@@ -270,7 +266,6 @@ async function copyText(text,msg){
   try{await navigator.clipboard.writeText(text);toast(msg||'已复制到剪贴板')}
   catch(e){const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast(msg||'已复制到剪贴板')}
 }
-function copyAll(){copyText(JSON.stringify(SOURCES),'已复制 '+SOURCES.length+' 个书源，去阅读 App 粘贴导入')}
 function copyNetUrl(){const u=new URL('sources.json',location.href).href;copyText(u,'网络导入链接已复制')}
 function copyOne(i){copyText(JSON.stringify([SOURCES[i]]),'已复制该书源')}
 
