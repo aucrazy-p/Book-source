@@ -81,18 +81,35 @@ jobs:
           python3 scripts/make_probe_input.py ci
           echo "targets=$(wc -l < runs/ci/targets.jsonl) rust_input=$(python3 -c "import json;print(len(json.load(open('runs/ci/probe_input.json'))))")"
 
-      - name: Probe (Rust four-step CLI)
+      - name: Probe (Rust four-step CLI in sandbox)
         # 四步真探测替代旧 Python 搜索层命中。head 门禁：头部至少 1 本四步全过（§17.1 B-2）。
+        # 不可信书源 JS 在一次性容器里执行（方案 §11）：非 root、只读根、tmpfs、
+        # cgroup 内存/PID 限制、硬超时；容器不注入任何 token/Secret。
         # 输出 matrix.jsonl 直接喂 04_select / 06_pool commit。
         run: |
           set -e
-          ./bin/probe-kernel \
-            runs/ci/probe_input.json \
-            runs/ci/probe_books.json \
-            runs/ci/matrix.jsonl \
+          # 1) 沙箱底座镜像（非 root；probe-kernel 二进制运行时挂载，不固化进镜像）
+          docker build -q -t probe-sandbox -f probe-kernel/Dockerfile probe-kernel/
+          # 2) 让容器内非 root 用户(uid 10001)可写产物目录
+          chmod -R a+rwX runs
+          # 3) 一次性容器执行；timeout 兜底 rquickjs 无 JS 执行硬中断的短板（§11）
+          docker rm -f probe-sandbox-run 2>/dev/null || true
+          timeout --signal=TERM --kill-after=30s 1200s \
+          docker run --rm --name probe-sandbox-run \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,size=256m \
+            --tmpfs /home/probe:rw,nosuid,size=64m \
+            --memory=2g --memory-swap=2g --cpus=2 --pids-limit=512 \
+            -v "$PWD/bin/probe-kernel:/usr/local/bin/probe-kernel:ro" \
+            -v "$PWD/runs:/work/runs:rw" \
+            probe-sandbox \
+            /work/runs/ci/probe_input.json \
+            /work/runs/ci/probe_books.json \
+            /work/runs/ci/matrix.jsonl \
             --concurrency 4 --timeout-secs 12 \
             --min-chapters 3 --min-content-chars 500 \
             --min-books-pass 1 --min-head-books 1
+          docker rm -f probe-sandbox-run 2>/dev/null || true
           python3 - <<'PY'
           import json, collections
           rows = [json.loads(l) for l in open('runs/ci/matrix.jsonl', encoding='utf-8') if l.strip()]

@@ -120,13 +120,16 @@ def plan(run_id, size):
             if sid not in pool_ids and sid not in retired:
                 picked.append(r)
             i += 1
-        # 池内源一并纳入本轮复测（不占 50 新候选名额）。否则 fill 模式下池内源
-        # 永不重测：变坏的源（如 L4 后来观测到 java.* 危险调用、或搜索失效）无法
-        # 被 commit 的二次安全过滤发现，池会缓慢腐化。复测结果的 risk 会写进
-        # matrix，由二次过滤清出并记入 retired。
-        for p in st["pool"]:
+        targets = list(picked)
+        # 池统一清理（方案 §19.3）：fill 阶段池内源平时不重测，变坏的源发现不了。
+        # 每轮额外轮转复测最多 RECHECK_BATCH 个池内源（不占新候选 50 名额），
+        # 探测总量 ≤ size + RECHECK_BATCH。复测结果进 matrix，由 commit 的
+        # 二次安全过滤按 risk 清出并记入 retired。用 last_checked_round 轮转，避免漏检。
+        RECHECK_BATCH = 10
+        due = sorted(st["pool"], key=lambda p: p.get("last_checked_round", -1))
+        for p in due[:RECHECK_BATCH]:
             sid = p["source_id"]
-            if sid in {t["source_id"] for t in targets} or sid in st["retired"]:
+            if sid in {t["source_id"] for t in targets}:
                 continue
             targets.append({
                 "source_id": sid, "domain": p.get("domain", ""),
@@ -283,9 +286,13 @@ def commit(run_id, fail_limit, blocked_limit):
         hit, ev = is_adult(p.get("source", {}))
         if hit:
             reason = "adult_filter:" + ev
+            risk = None
         else:
             # 只在本轮测到该源且有明确非 clean 判定时才移出；本轮没测到的保留不动。
             risk = risk_by_id.get(p["source_id"])
+            # 本轮被复测到的池内源，登记轮次供 plan 轮转（避免每轮重复测同一批）。
+            if risk is not None:
+                p["last_checked_round"] = st["round"]
             reason = ("risk_filter:" + str(risk)) if risk is not None and risk != "clean" else None
         if reason:
             st["retired"][p["source_id"]] = {

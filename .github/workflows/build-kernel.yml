@@ -18,13 +18,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system deps
-        # rquickjs 需要 C 编译器；ubuntu runner 自带 gcc，这里只补 pkg-config/libssl 等常见缺项
+        # musl-tools 提供 musl-gcc：rquickjs 的 C 代码与最终二进制都静态链接，
+        # 产物不依赖 glibc，才能稳定跑在 alpine 沙箱里（不受 runner 滚动升级影响）。
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential pkg-config libssl-dev
+          sudo apt-get install -y -qq build-essential pkg-config musl-tools
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -32,11 +35,16 @@ jobs:
           workspaces: probe-kernel
 
       - name: Build release
-        run: cargo build --release --manifest-path probe-kernel/Cargo.toml
+        # 静态链接 musl：产物可跑在任意 Linux 容器，无 glibc 版本依赖。
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl
 
       - name: Smoke test (unit tests)
         # 跑 behavior 判定单测，验证 L4 hook 逻辑（不联网）
-        run: cargo test --release --manifest-path probe-kernel/Cargo.toml behavior::tests -- --nocapture
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl behavior::tests -- --nocapture
 
       - name: Smoke test (four-step probe)
         # 用刚编译的二进制对线上 9 源跑一次四步探测（联网），验证 CLI 运行期正确。
@@ -44,7 +52,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 20
         run: |
-          probe-kernel/target/release/probe-kernel \
+          probe-kernel/target/x86_64-unknown-linux-musl/release/probe-kernel \
             docs/sources.json conf/probe_books.json smoke.jsonl \
             --concurrency 4 --timeout-secs 12
           echo "=== 冒烟结果汇总 ==="
@@ -70,7 +78,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp probe-kernel/target/release/probe-kernel dist/
+          cp probe-kernel/target/x86_64-unknown-linux-musl/release/probe-kernel dist/
+          file dist/probe-kernel  # 确认静态链接（statically linked）
           cd dist && tar czf probe-kernel-linux-x64.tar.gz probe-kernel
           sha256sum probe-kernel-linux-x64.tar.gz > probe-kernel-linux-x64.tar.gz.sha256
 
