@@ -121,11 +121,11 @@ def plan(run_id, size):
                 picked.append(r)
             i += 1
         targets = list(picked)
-        # 池统一清理（方案 §19.3）：fill 阶段池内源平时不重测，变坏的源发现不了。
-        # 每轮额外轮转复测最多 RECHECK_BATCH 个池内源（不占新候选 50 名额），
-        # 探测总量 ≤ size + RECHECK_BATCH。复测结果进 matrix，由 commit 的
-        # 二次安全过滤按 risk 清出并记入 retired。用 last_checked_round 轮转，避免漏检。
-        RECHECK_BATCH = 10
+        # 池统一清理（方案 §19.3）：判定规则变更后（书名精确+作者校验），
+        # 存量池源必须尽快用新规则复检，不能靠 10 个/轮慢慢轮转——否则
+        # 旧假阳性源（如只能搜到同人的站）会一直占位发布。池未满时源数有限，
+        # 全量复测成本可控；池满 50 后走 recheck 模式天然全量。
+        RECHECK_BATCH = len(st["pool"])
         due = sorted(st["pool"], key=lambda p: p.get("last_checked_round", -1))
         for p in due[:RECHECK_BATCH]:
             sid = p["source_id"]
