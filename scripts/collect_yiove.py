@@ -15,6 +15,7 @@
 
 用法：python collect_yiove.py <run_id> [--collections 8] [--single 0] [--pages 1]
 """
+import gzip
 import hashlib
 import json
 import os
@@ -29,6 +30,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 from lib import SYSTEM_OPENER, UA, decode_body, dump_json, run_dir
+
+# 候选种子兜底：上游采集全失败（如 GitHub Actions 机房 IP 被 yiove 403）时，
+# 用上次成功快照的 gzip 种子继续跑，避免池空转。种子只做兜底，正常采集优先。
+SEED_PATH = os.path.join(ROOT, "conf", "candidate_seed.json.gz")
 
 API = "https://shuyuan-api.yiove.com"
 COLS = API + "/shuyuan/book-source-collections"
@@ -64,6 +69,31 @@ def get_json(url):
     return None, {"url": url, "error": last, "at": datetime.now(timezone.utc).isoformat()}
 
 
+def load_seed():
+    """读 gzip 种子，返回 (sources, meta)；种子缺失/损坏返回 ([], meta)。"""
+    meta = {"kind": "seed", "path": SEED_PATH, "at": datetime.now(timezone.utc).isoformat()}
+    if not os.path.exists(SEED_PATH):
+        meta["error"] = "seed file missing"
+        return [], meta
+    try:
+        with gzip.open(SEED_PATH, "rb") as f:
+            obj = json.loads(f.read().decode("utf-8"))
+        sources = obj.get("sources", []) if isinstance(obj, dict) else []
+        sources = [s for s in sources if isinstance(s, dict) and s.get("bookSourceUrl")]
+        for s in sources:
+            s["_upstream_original"] = s.get("_upstream", "")
+            s["_upstream"] = "yiove:seed"
+            s["_seed_fallback"] = True
+        meta.update({"count": len(sources), "collected_at": obj.get("collected_at"),
+                     "sha256": hashlib.sha256(
+                         json.dumps(sources, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                     ).hexdigest()[:16]})
+        return sources, meta
+    except Exception as e:
+        meta["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return [], meta
+
+
 def collect(run_id, n_cols, n_single, pages):
     d = run_dir(run_id)
     os.makedirs(d, exist_ok=True)
@@ -80,6 +110,11 @@ def collect(run_id, n_cols, n_single, pages):
             break
     col_items.sort(key=lambda x: x.get("view_total") or 0, reverse=True)
     col_items = col_items[:n_cols]
+    # 把上游错误打到 stdout（原先只写进 provenance，日志静默难排查）
+    list_errors = [p.get("error") for p in provenance
+                   if p.get("kind") == "collection_list" and p.get("error")]
+    if list_errors:
+        print("[采集] 警告：合集列表请求失败 → %s" % "; ".join(list_errors))
     print("[采集] 合集候选 %d 个（按访问量取前 %d）" % (len(col_items), n_cols))
 
     for c in col_items:
@@ -117,11 +152,24 @@ def collect(run_id, n_cols, n_single, pages):
                   % (len(singles), n_single))
 
     sources = list(merged.values())
+    strategy = "top_collections_by_view_total"
+    if not sources:
+        # 上游全失败（如 CI 机房 IP 被 403）：回退种子，保证池不空转、流程能跑通。
+        seed_sources, seed_meta = load_seed()
+        provenance.append(seed_meta)
+        if seed_sources:
+            sources = seed_sources
+            strategy = "seed_fallback"
+            print("[采集] 上游 0 条 → 回退种子 %d 条（采于 %s）"
+                  % (len(sources), seed_meta.get("collected_at", "?")))
+        else:
+            print("[采集] 上游 0 条，且种子不可用：%s" % seed_meta.get("error", "未知"))
+
     payload = {
         "run_id": run_id,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "upstream": "yiove",
-        "strategy": "top_collections_by_view_total",
+        "strategy": strategy,
         "source_count": len(sources),
         "provenance": provenance,
         "sources": sources,
