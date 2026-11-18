@@ -239,11 +239,66 @@ fn main_book(title: &str) -> String {
     if out.is_empty() { title.trim().to_string() } else { out.to_string() }
 }
 
+/// 书名归一化：沿用 main_book（剥冒号前缀与括号内容）再去掉空白与分隔标点，
+/// 让「斗破 苍穹」「斗破苍穹精校版」与「斗破苍穹」可比。
+fn norm_title(s: &str) -> String {
+    let base = main_book(s);
+    base.chars()
+        .filter(|c| !c.is_whitespace()
+            && !matches!(c, '：' | ':' | '－' | '—' | '–' | '·' | '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '《' | '》' | '「' | '」' | '_' | '-' | '｜' | '|'))
+        .collect()
+}
+
 fn name_match(actual: &str, expected: &str) -> bool {
-    let a = main_book(actual.trim());
-    let e = main_book(expected.trim());
+    let a = norm_title(actual.trim());
+    let e = norm_title(expected.trim());
     if a.is_empty() || e.is_empty() { return false; }
-    a == e || (a.chars().count() >= 2 && e.chars().count() >= 2 && (a.contains(&e) || e.contains(&a)))
+    if a == e { return true; }
+    // 仅放行「探针书名 + 干净版本后缀」：斗破苍穹精校版 等。
+    // 不再允许双向子串——「综漫：从斗破苍穹特殊篇开始」这类同人必须判失败。
+    match a.strip_prefix(&e) {
+        Some(rest) => is_version_suffix(rest),
+        None => false,
+    }
+}
+/// 作者匹配：书单没配作者时跳过；配了则归一化（去空白/·/著）后要求一致。
+/// 对短作者名双向 contains 足够安全（典型变体只有「天蚕土豆著」），
+/// 能挡住同人作者（牛头老哥 != 天蚕土豆）。
+fn author_match(actual: &str, expected: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.chars().filter(|c| !c.is_whitespace() && *c != '·' && *c != '著').collect()
+    };
+    let a = norm(actual.trim());
+    let e = norm(expected.trim());
+    if e.is_empty() { return true; }
+    if a.is_empty() { return false; }
+    a == e || a.contains(&e) || e.contains(&a)
+}
+
+/// 版本后缀白名单：去掉探针书名前缀后，剩余必须只由这些词构成（总长 ≤8）。
+fn is_version_suffix(rest: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "精校版", "精校", "校对版", "校对", "完结版", "完结", "全集", "全本",
+        "无删减", "无删节", "修订版", "典藏版", "整理版", "txt", "TXT",
+        "下载", "在线阅读", "最新", "正文", "完整版",
+    ];
+    let r = rest.trim();
+    if r.is_empty() || r.chars().count() > 8 { return false; }
+    let mut remain = r;
+    let mut changed = true;
+    while changed && !remain.is_empty() {
+        changed = false;
+        for s in SUFFIXES {
+            if let Some(stripped) = remain.strip_prefix(s) {
+                remain = stripped.trim_start();
+                changed = true;
+            } else if let Some(stripped) = remain.strip_suffix(s) {
+                remain = stripped.trim_end();
+                changed = true;
+            }
+        }
+    }
+    remain.is_empty()
 }
 
 fn looks_blocked(text: &str) -> bool {
@@ -373,13 +428,17 @@ fn run_four_steps_with_http(
     let books = pjs::with_search_context(&book.title, 1, || {
         with_source_ctx(source, || parser.search_books(source, &resp.body, &resp.url))
     });
-    let matched: Vec<String> = books.iter().filter(|b| name_match(&b.name, &book.title)).map(|b| b.name.clone()).collect();
+    let matched: Vec<String> = books.iter()
+        .filter(|b| name_match(&b.name, &book.title) && author_match(&b.author, &book.author))
+        .map(|b| b.name.clone()).collect();
     if matched.is_empty() {
         let why = if books.is_empty() { "no_result_items" } else { "no_title_match" };
         steps.insert("search".into(), fail_step("SEARCH_PARSE", 0, why));
         return (steps, false, total_ms);
     }
-    let picked = books.iter().find(|b| name_match(&b.name, &book.title)).cloned().unwrap();
+    let picked = books.iter()
+        .find(|b| name_match(&b.name, &book.title) && author_match(&b.author, &book.author))
+        .cloned().unwrap();
     steps.insert("search".into(), StepResult { ok: true, ms: Some(total_ms), results: Some(books.len()), matched: Some(matched), ..StepResult::default() });
 
     // ---- 2) detail ----
@@ -398,8 +457,11 @@ fn run_four_steps_with_http(
         book: serde_json::json!({"bookUrl": detail_url, "tocUrl": detail_url}),
         chapter: serde_json::json!({}),
     }), || with_source_ctx(source, || parser.book_info(source, &dresp.body, &dresp.url, &detail_url)));
-    if info.name.trim().is_empty() || !name_match(&info.name, &book.title) {
-        steps.insert("detail".into(), fail_step("DETAIL_PARSE", 0, &format!("bad_name:{}", info.name)));
+    if info.name.trim().is_empty()
+        || !name_match(&info.name, &book.title)
+        || !author_match(&info.author, &book.author) {
+        steps.insert("detail".into(), fail_step("DETAIL_PARSE", 0,
+            &format!("bad_name:{}/bad_author:{}", info.name, info.author)));
         return (steps, false, total_ms);
     }
     steps.insert("detail".into(), StepResult { ok: true, ms: Some(df.ms), name: Some(info.name.clone()), author: Some(info.author.clone()), ..StepResult::default() });

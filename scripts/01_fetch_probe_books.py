@@ -21,19 +21,18 @@ from lib import dump_json, load_json, run_dir
 
 def prepare(run_id):
     books = load_json(CONF)
-    tiers = {k: books.get(k, []) for k in ("classic", "hot", "waist", "longtail")}
-    if not tiers["classic"] or not tiers["hot"]:
-        print("[探针书单] conf 缺 classic/hot，终止")
+    tiers = {k: books.get(k, []) for k in ("classic", "waist", "longtail")}
+    # v5 书单（头10/腰10/尾10）已无 hot 层；三层均需非空
+    if not tiers["classic"] or not tiers["waist"] or not tiers["longtail"]:
+        print("[探针书单] conf 缺 classic/waist/longtail，终止")
         sys.exit(2)
-    if not tiers["waist"] or not tiers["longtail"]:
-        print("[探针书单] 警告：conf 缺 waist/longtail，长尾「书全」主指标无法计算")
     d = run_dir(run_id)
     os.makedirs(d, exist_ok=True)
     books["_meta"] = {"prepared_at": datetime.now(timezone.utc).isoformat(),
-                      "source": "conf/probe_books.json (fixed)"}
+                      "source": "conf/probe_books.json (fixed v5: 30 books, title+author)"}
     dump_json(os.path.join(d, "probe_books.json"), books)
-    print("[探针书单] 经典=%d 热门=%d 腰部=%d 长尾=%d → %s"
-          % (len(tiers["classic"]), len(tiers["hot"]), len(tiers["waist"]),
+    print("[探针书单] 经典=%d 腰部=%d 长尾=%d（全部书名+作者双校验）→ %s"
+          % (len(tiers["classic"]), len(tiers["waist"]),
              len(tiers["longtail"]), os.path.join(d, "probe_books.json")))
     return books
 
