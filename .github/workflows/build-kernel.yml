@@ -20,9 +20,60 @@ jobs:
       - name: Install system deps
         # musl-tools 提供 musl-gcc：rquickjs 的 C 代码与最终二进制都静态链接，
         # 产物不依赖 glibc，才能稳定跑在 alpine 沙箱里（不受 runner 滚动升级影响）。
+        #
+        # apt 加固（2026-11-19）：连续两次构建都倒在这一步，报
+        #   "Could not wait for server fd - select (11) [IP: 185.125.190.82]"
+        # 三处应对：
+        #   1) 只装缺的 —— runner 镜像已预装 build-essential/pkg-config，
+        #      原写法会去升级它们，白下 3/4 流量并放大失败面；
+        #   2) 关掉 http pipeline —— select(11) 的已知诱因；
+        #   3) 多次重试 + 把 Azure 专用 mirror+file 兜底换成官方 archive 源。
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential pkg-config musl-tools
+          set -uo pipefail
+          need=()
+          for p in build-essential pkg-config musl-tools; do
+            dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
+          done
+          if [ ${#need[@]} -eq 0 ]; then
+            echo "系统依赖已全部预装"
+            musl-gcc --version | head -1
+            exit 0
+          fi
+          echo "需要安装: ${need[*]}"
+
+          opts="-y -qq --no-install-recommends --fix-missing \
+          -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 \
+          -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+          -o Acquire::Languages=none"
+          try_install() {
+            sudo apt-get update -qq -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 >/dev/null 2>&1 || true
+            sudo apt-get install $opts "$@" 2>&1 | tail -15
+            return ${PIPESTATUS[0]}
+          }
+
+          ok=0
+          for i in 1 2 3; do
+            echo "--- apt 第 $i 次尝试（当前 mirror 配置）---"
+            if try_install "${need[@]}"; then ok=1; break; fi
+            sleep 15
+          done
+
+          if [ $ok -ne 1 ]; then
+            echo "--- 仍失败，切换 archive.ubuntu.com 重试 ---"
+            sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            for i in 1 2 3; do
+              echo "--- apt 第 $i 次尝试（archive.ubuntu.com）---"
+              if try_install "${need[@]}"; then ok=1; break; fi
+              sleep 15
+            done
+          fi
+
+          if [ $ok -ne 1 ]; then
+            echo "::error::apt 安装失败：6 次重试均未成功"
+            exit 1
+          fi
+          musl-gcc --version | head -1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
