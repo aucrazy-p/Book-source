@@ -21,59 +21,88 @@ jobs:
         # musl-tools 提供 musl-gcc：rquickjs 的 C 代码与最终二进制都静态链接，
         # 产物不依赖 glibc，才能稳定跑在 alpine 沙箱里（不受 runner 滚动升级影响）。
         #
-        # apt 加固（2026-11-19）：连续两次构建都倒在这一步，报
-        #   "Could not wait for server fd - select (11) [IP: 185.125.190.82]"
-        # 三处应对：
-        #   1) 只装缺的 —— runner 镜像已预装 build-essential/pkg-config，
-        #      原写法会去升级它们，白下 3/4 流量并放大失败面；
-        #   2) 关掉 http pipeline —— select(11) 的已知诱因；
-        #   3) 多次重试 + 把 Azure 专用 mirror+file 兜底换成官方 archive 源。
+        # apt 加固（2026-11-19，第 3 版）：连续三次构建都倒在这一步。
+        # 日志证据：
+        #   a) "需要安装: build-essential musl-tools" —— 新镜像（26.04）没预装
+        #      build-essential，不能再假设依赖现成；
+        #   b) "Could not wait for server fd - select (11)" + 多包同时下载失败，
+        #      随后 "musl-dev is not selected for install" 连带整个安装中止。
+        # 应对：
+        #   1) Acquire::Queue-Mode=access —— 强制单连接串行下载，避开并行连接
+        #      触发的 select(11)；这是本次的关键改动；
+        #   2) 去掉 --fix-missing —— 它只会"修正缺失"然后二次失败、卡在重试里；
+        #   3) apt 仍不行就用 curl 直取 .deb 再 dpkg 本地安装，绕开 apt 下载器；
+        #      下载地址由 apt 自己的索引算出（自动适配版本号与 amd64v3 变体）；
+        #   4) 每步加 timeout，杜绝"卡在这里不动"。
         run: |
           set -uo pipefail
+          echo "=== 环境诊断 ==="
+          if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            echo "OS: ${PRETTY_NAME:-unknown}"
+          fi
+          echo "ulimit -n = $(ulimit -n)"
+          env | grep -iE '^(http_proxy|https_proxy|all_proxy|no_proxy)=' || echo "代理环境变量: 无"
+          apt-config dump 2>/dev/null | grep -iE 'Queue-Mode|Pipeline-Depth|::Proxy' || echo "apt 队列/代理配置: 默认"
+
           need=()
-          for p in build-essential pkg-config musl-tools; do
+          for p in build-essential musl musl-dev musl-tools; do
             dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
           done
           if [ ${#need[@]} -eq 0 ]; then
-            echo "系统依赖已全部预装"
+            echo "依赖已全部预装"
             musl-gcc --version | head -1
             exit 0
           fi
           echo "需要安装: ${need[*]}"
 
-          opts="-y -qq --no-install-recommends --fix-missing \
-          -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 \
-          -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-          -o Acquire::Languages=none"
-          try_install() {
-            sudo apt-get update -qq -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 >/dev/null 2>&1 || true
-            sudo apt-get install $opts "$@" 2>&1 | tail -15
+          ACQ='-o Acquire::Queue-Mode=access -o Acquire::http::Pipeline-Depth=0
+               -o Acquire::Retries=3 -o Acquire::http::Timeout=60
+               -o Acquire::https::Timeout=60'
+          run_apt() {
+            timeout 420 sudo apt-get "$@" $ACQ 2>&1 | tail -12
             return ${PIPESTATUS[0]}
           }
 
+          run_apt update -qq || echo "(apt update 未完全成功，继续尝试安装)"
           ok=0
           for i in 1 2 3; do
-            echo "--- apt 第 $i 次尝试（当前 mirror 配置）---"
-            if try_install "${need[@]}"; then ok=1; break; fi
-            sleep 15
+            echo "--- apt install 第 $i 次（单连接模式）---"
+            if run_apt install -y -qq --no-install-recommends "${need[@]}"; then ok=1; break; fi
+            sleep 10
           done
 
           if [ $ok -ne 1 ]; then
-            echo "--- 仍失败，切换 archive.ubuntu.com 重试 ---"
+            echo "--- apt 下载仍失败，改用 curl 直取 .deb + dpkg ---"
             sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' \
               /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-            for i in 1 2 3; do
-              echo "--- apt 第 $i 次尝试（archive.ubuntu.com）---"
-              if try_install "${need[@]}"; then ok=1; break; fi
-              sleep 15
+            run_apt update -qq || true
+            mkdir -p /tmp/debs && rm -f /tmp/debs/*.deb
+            uris=$(apt-get install --print-uris -y --no-install-recommends "${need[@]}" 2>/dev/null \
+                   | grep -oE "'https?://[^']+\.deb'" | tr -d "'" | sort -u)
+            echo "$uris" | sed 's/^/  URI: /'
+            dl=0
+            for u in $uris; do
+              f="/tmp/debs/$(basename "$u")"
+              if curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --max-time 180 -o "$f" "$u"; then
+                dl=$((dl+1)); echo "  下载成功 $(basename "$u")"
+              else
+                echo "  下载失败 $u"
+              fi
             done
+            if [ "$dl" -gt 0 ]; then
+              sudo dpkg -i /tmp/debs/*.deb && ok=1
+              sudo dpkg --configure -a || true
+            fi
           fi
 
           if [ $ok -ne 1 ]; then
-            echo "::error::apt 安装失败：6 次重试均未成功"
+            echo "::error::依赖安装失败：apt 与 curl 两条路都没成功"
             exit 1
           fi
+          echo "=== 校验 ==="
           musl-gcc --version | head -1
+          gcc --version | head -1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
