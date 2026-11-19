@@ -92,9 +92,12 @@ jobs:
           docker build -q -t probe-sandbox -f probe-kernel/Dockerfile probe-kernel/
           # 2) 让容器内非 root 用户(uid 10001)可写产物目录
           chmod -R a+rwX runs
-          # 3) 一次性容器执行；timeout 兜底 rquickjs 无 JS 执行硬中断的短板（§11）
+          # 3) 一次性容器执行；timeout 只是最后的兜底闸（真正的闸在 kernel 内部：
+          #    --per-source-secs 单源墙钟 + --global-budget-secs 整轮预算）。
+          #    2026-11-19 run 44416491025 曾以 1232s 撞穿 1200s 被 SIGKILL(exit 137)，
+          #    故外层放宽到 1800s 留安全垫，不再承担限速职责。
           docker rm -f probe-sandbox-run 2>/dev/null || true
-          timeout --signal=TERM --kill-after=30s 1200s \
+          timeout --signal=TERM --kill-after=30s 1800s \
           docker run --rm --name probe-sandbox-run \
             --read-only \
             --tmpfs /tmp:rw,nosuid,size=256m \
@@ -107,6 +110,7 @@ jobs:
             /work/runs/ci/probe_books.json \
             /work/runs/ci/matrix.jsonl \
             --concurrency 4 --timeout-secs 12 \
+            --read-timeout-secs 15 --per-source-secs 75 --global-budget-secs 900 \
             --min-chapters 3 --min-content-chars 500 \
             --min-books-pass 1 --min-head-books 1
           docker rm -f probe-sandbox-run 2>/dev/null || true

@@ -22,6 +22,9 @@ pub struct HttpClient {
     client: Arc<RwLock<Client>>,
     active_proxy: Arc<RwLock<Option<String>>>,
     timeout_secs: u64,
+    /// 读超时(独立于连接超时)。阅读器沿用 `SOURCE_READ_TIMEOUT_SECS`,
+    /// 批量探测可传更短的值。
+    read_timeout_secs: u64,
     source_sessions: Arc<RwLock<HashMap<String, Arc<SourceSession>>>>,
     source_clients: Arc<RwLock<HashMap<String, Client>>>,
     source_storage_dir: Arc<RwLock<Option<PathBuf>>>,
@@ -29,15 +32,32 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(timeout_secs: u64, proxy: Option<String>) -> anyhow::Result<Self> {
+        Self::new_with_read_timeout(timeout_secs, SOURCE_READ_TIMEOUT_SECS, proxy)
+    }
+
+    /// 与 [`Self::new`] 相同, 但**读超时可单独指定**。
+    ///
+    /// 阅读器/常规抓取走 `new`(读 60s, 与 legado 的 `readTimeout = 60s` 对齐)。
+    /// 批量探测(probe-kernel)要跑几十个源 × 上百个请求, 若读超时仍按 60s 算,
+    /// 几个慢站就能吃光整轮墙钟 —— 那条路径传更短的值。
+    ///
+    /// 两个轴的关系不变: `connect_secs` 只决定"多久连不上算不通",
+    /// `read_secs` 决定"连上后等响应多久", 总超时取二者较大值。
+    pub fn new_with_read_timeout(
+        connect_secs: u64,
+        read_secs: u64,
+        proxy: Option<String>,
+    ) -> anyhow::Result<Self> {
         let configured_proxy = match proxy {
             Some(value) => resolve_manual_proxy(&value)?,
             None => resolve_system_proxy(),
         };
-        let client = build_client(timeout_secs, configured_proxy.as_deref())?;
+        let client = build_client(connect_secs, read_secs, configured_proxy.as_deref())?;
         Ok(Self {
             client: Arc::new(RwLock::new(client)),
             active_proxy: Arc::new(RwLock::new(configured_proxy)),
-            timeout_secs,
+            timeout_secs: connect_secs,
+            read_timeout_secs: read_secs,
             source_sessions: Arc::default(),
             source_clients: Arc::default(),
             source_storage_dir: Arc::default(),
@@ -133,14 +153,14 @@ impl HttpClient {
 
     /// 完全不走代理的直连客户端。用于代理出口 IP 被目标站点限流时的回退。
     pub fn client_direct(&self) -> anyhow::Result<Client> {
-        build_client(self.timeout_secs, None)
+        build_client(self.timeout_secs, self.read_timeout_secs, None)
     }
 
     pub fn client_with_proxy(&self, proxy: Option<&str>) -> anyhow::Result<Client> {
         match proxy.map(str::trim).filter(|value| !value.is_empty()) {
             Some(value) => {
                 let proxy = resolve_manual_proxy(value)?;
-                build_client(self.timeout_secs, proxy.as_deref())
+                build_client(self.timeout_secs, self.read_timeout_secs, proxy.as_deref())
             }
             None => Ok(self.client()),
         }
@@ -158,7 +178,7 @@ impl HttpClient {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
         };
-        build_client(self.timeout_secs, configured_proxy.as_deref())
+        build_client(self.timeout_secs, self.read_timeout_secs, configured_proxy.as_deref())
     }
 
     pub fn configure_proxy(
@@ -183,7 +203,7 @@ impl HttpClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if current_proxy != configured_proxy {
-            let client = build_client(self.timeout_secs, configured_proxy.as_deref())?;
+            let client = build_client(self.timeout_secs, self.read_timeout_secs, configured_proxy.as_deref())?;
             *self
                 .client
                 .write()
@@ -211,7 +231,7 @@ impl HttpClient {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let client = build_client(self.timeout_secs, configured_proxy.as_deref())?;
+        let client = build_client(self.timeout_secs, self.read_timeout_secs, configured_proxy.as_deref())?;
         *self
             .client
             .write()
@@ -220,8 +240,8 @@ impl HttpClient {
     }
 }
 
-fn build_client(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client> {
-    build_client_builder(timeout_secs, proxy)?.cookie_store(true).build().map_err(Into::into)
+fn build_client(timeout_secs: u64, read_timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client> {
+    build_client_builder(timeout_secs, read_timeout_secs, proxy)?.cookie_store(true).build().map_err(Into::into)
 }
 
 pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
@@ -257,8 +277,8 @@ pub(crate) fn build_raw_source_client(timeout_secs: u64, proxy: Option<&str>, ja
         .map_err(Into::into)
 }
 
-fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
-    let builder = build_builder_base(timeout_secs, proxy)?
+fn build_client_builder(timeout_secs: u64, read_timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
+    let builder = build_builder_base(timeout_secs, read_timeout_secs, proxy)?
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     Ok(builder)
 }
@@ -275,7 +295,7 @@ fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Resul
 /// `http1_title_case_headers` 只影响 HTTP/1.x(h2 要求小写, hyper 会自行处理),
 /// 显式 `Host` 由 [`crate::crawler::fetcher`] 注入到请求首位。
 fn build_source_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
-    Ok(build_builder_base(timeout_secs, proxy)?
+    Ok(build_builder_base(timeout_secs, SOURCE_READ_TIMEOUT_SECS, proxy)?
         .http1_title_case_headers()
         .http1_only())
 }
@@ -287,12 +307,19 @@ fn build_source_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Resul
 /// （尤其是带图床或反爬延迟的站）就直接超时，而手机端同样的源能读 —— 这类
 /// 「手机能看、桌面空白」有一部分就是这个原因。
 ///
-/// 不把 60s 做成配置项：它是**协议层容忍度**而不是产品偏好，跟 `request_timeout_secs`
+/// 不把 60s 做成**阅读器**的配置项：它是协议层容忍度而不是产品偏好，跟 `request_timeout_secs`
 /// （连接阶段多久算不通）语义不同，混在一起调会让用户以为调大就能救慢站，
 /// 实际先把「站点已挂」的判断拖长了。
+///
+/// 批量探测是唯一的例外：`HttpClient::new_with_read_timeout` 允许那条路径
+/// 传更短的读超时（默认 15s），否则几十个源 × 上百个请求累加会把整轮墙钟吃穿。
 const SOURCE_READ_TIMEOUT_SECS: u64 = 60;
 
-fn build_builder_base(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
+fn build_builder_base(
+    timeout_secs: u64,
+    read_timeout_secs: u64,
+    proxy: Option<&str>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
         // TLS：与 legado 一致，**不校验证书与主机名**。
         //
@@ -308,11 +335,12 @@ fn build_builder_base(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<
         .danger_accept_invalid_hostnames(true)
         // 连接阶段：沿用可配置的 `request_timeout_secs`。
         .connect_timeout(Duration::from_secs(timeout_secs.max(1)))
-        // 读取阶段：按 legado 的 60s。`timeout` 是 reqwest 的**总**超时，
+        // 读取阶段：默认按 legado 的 60s（`SOURCE_READ_TIMEOUT_SECS`），
+        // 批量探测可传更短值。`timeout` 是 reqwest 的**总**超时，
         // 必须 ≥ 读超时，否则连接快的慢响应仍会被总超时砍掉。
-        .read_timeout(Duration::from_secs(SOURCE_READ_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(read_timeout_secs.max(1)))
         .timeout(Duration::from_secs(
-            SOURCE_READ_TIMEOUT_SECS.max(timeout_secs),
+            read_timeout_secs.max(timeout_secs).max(1),
         ));
     if let Some(proxy) = proxy {
         let bypass = NoProxy::from_string("localhost,127.0.0.1,::1");

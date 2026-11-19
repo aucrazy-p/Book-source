@@ -5,7 +5,10 @@
 //!
 //! options:
 //!   --concurrency N        并发源数，默认 4
-//!   --timeout-secs N       单请求超时，默认 12
+//!   --timeout-secs N       单请求连接超时，默认 12
+//!   --read-timeout-secs N  单请求读超时，默认 15（阅读器仍用 60s）
+//!   --per-source-secs N    单源墙钟上限（gate + 30 本），默认 75；超时判 TIMEOUT
+//!   --global-budget-secs N 整轮墙钟预算，默认 900；超出后剩余源直接判 TIMEOUT
 //!   --min-chapters N       目录可读章节阈值，默认 3
 //!   --min-content-chars N  正文字数阈值，默认 500
 //!   --min-books-pass N     PASSED 门槛：至少 N 本书跑通四步，默认 1
@@ -155,6 +158,15 @@ struct ProbeResult {
 struct Config {
     concurrency: usize,
     timeout_secs: u64,
+    /// 单请求读超时。探测路径用短值（默认 15s），否则几十个源 × 上百个请求
+    /// 按 60s 累加就能吃穿整轮墙钟。阅读器不受影响（仍 60s）。
+    read_timeout_secs: u64,
+    /// 单源墙钟上限：gate + 30 本探针书。超时判 `TIMEOUT`，保留已采部分结果。
+    /// 依据历史均速（402s / 60 源 ≈ 27s/源）留 ~3 倍余量。
+    per_source_secs: u64,
+    /// 整轮墙钟预算：超预算的源不再探测，直接产 `TIMEOUT` 行占位。
+    /// 默认 900s = CI 容器 `timeout 1800s` 的一半，留足安全垫。
+    global_budget_secs: u64,
     min_chapters: usize,
     min_content_chars: usize,
     /// PASSED 门槛：至少 N 本探针书完整跑通四步。默认 1（证明链路真实可用即合格；
@@ -173,6 +185,9 @@ impl Default for Config {
         Self {
             concurrency: 4,
             timeout_secs: 12,
+            read_timeout_secs: 15,
+            per_source_secs: 75,
+            global_budget_secs: 900,
             min_chapters: 3,
             min_content_chars: 500,
             min_books_pass: 1,
@@ -543,6 +558,48 @@ fn judge_with_timeout(host: &str, events: &[behavior::BehaviorEvent], ms: u64, c
     (level, reasons)
 }
 
+/// 整轮预算耗尽时给未探测源生成占位行。
+///
+/// 为什么要产行而不是跳过：下游 06_pool / 04_select 按 source_id join，
+/// 缺行会被当成异常数据；行数必须与 targets 对齐。`status=TIMEOUT` 的语义是
+/// 「本轮没测」，因此不计失败、不改轮次、也不按 risk 移出池。
+fn timeout_result(rec: &SourceRec, fail_stage: &str) -> ProbeResult {
+    let source = &rec.source;
+    let url = source.book_source_url.clone();
+    let host = host_of(&url);
+    let sid = if rec.source_id.trim().is_empty() { source_id(&url) } else { rec.source_id.clone() };
+    ProbeResult {
+        source_id: sid,
+        domain: host,
+        book_source_name: source.book_source_name.clone(),
+        content_hash: rec.content_hash.clone(),
+        risk_level: "unknown".into(),
+        check_keyword: source.check_keyword(),
+        status: "TIMEOUT".into(),
+        search_ok: false,
+        search_status: "TIMEOUT".into(),
+        search_detail: fail_stage.to_string(),
+        fail_stage: fail_stage.to_string(),
+        respond_time_ms: 0,
+        probe_count: 0,
+        book_source_name_camel: source.book_source_name.clone(),
+        hit_classic: 0.0,
+        hit_hot: 0.0,
+        hit_waist: 0.0,
+        hit_longtail: 0.0,
+        head_gate_ok: false,
+        hits: HashMap::new(),
+        attempts: HashMap::new(),
+        hit_titles: Vec::new(),
+        probed_at: now_iso(),
+        steps: HashMap::new(),
+        steps_ok: 0,
+        behavior_events: Vec::new(),
+        behavior_level: "unknown".into(),
+        behavior_reasons: vec!["global_budget_exhausted".into()],
+    }
+}
+
 fn probe_source(
     rec: &SourceRec,
     books: &ProbeBooks,
@@ -550,6 +607,7 @@ fn probe_source(
     rt: &tokio::runtime::Handle,
     parser: &RuleEngine,
     cfg: &Config,
+    deadline: Instant,
 ) -> ProbeResult {
     let source = &rec.source;
     let url = source.book_source_url.clone();
@@ -588,14 +646,26 @@ fn probe_source(
     let mut attempts: HashMap<String, u32> = HashMap::new();
     let mut hit_titles: Vec<String> = Vec::new();
     let mut probe_count: u32 = 1;
+    // 单源墙钟超时标记。注意语义：TIMEOUT = 「这一轮没测完」，不是「源是坏的」——
+    // 下游 06_pool 不会把它计入 fail_streak、也不会按 risk 移出池。
+    let mut timed_out = false;
 
     if gate_ok {
+        let books_total = books.classic.len() + books.hot.len() + books.waist.len() + books.longtail.len();
         let mut tier_books: Vec<(&str, &ProbeBook)> = Vec::new();
         for b in &books.classic { tier_books.push(("classic", b)); }
         for b in &books.hot { tier_books.push(("hot", b)); }
         for b in &books.waist { tier_books.push(("waist", b)); }
         for b in &books.longtail { tier_books.push(("longtail", b)); }
         for (tier, b) in tier_books {
+            // 每本开头检查单源 deadline：慢源最坏 121 个请求 × 读超时，
+            // 一旦撞线立刻收手，把已采到的 hits/steps 当部分结果交出去。
+            if Instant::now() >= deadline {
+                timed_out = true;
+                eprintln!("[probe-kernel] {} 单源超时，已测 {}/{} 本，保留部分结果",
+                    source.book_source_name, probe_count - 1, books_total);
+                break;
+            }
             *attempts.entry(tier.to_string()).or_insert(0) += 1;
             probe_count += 1;
             let sf = fetch_step(http, rt, source, source.search_url.as_deref().unwrap_or(""), &b.title, &url);
@@ -631,13 +701,18 @@ fn probe_source(
     let head_pass = hits.get("classic").copied().unwrap_or(0)
         + hits.get("hot").copied().unwrap_or(0);
     let head_gate_ok = head_pass >= cfg.min_head_books;
-    let status = if !gate_ok {
+    let mut status = if !gate_ok {
         gate_status.to_string()
     } else if chain_ok && head_gate_ok {
         "PASSED".into()
     } else {
         "PARTIAL".into()
     };
+    // 撞了单源 deadline 且尚未达标 → 判 TIMEOUT（没测完，不是坏源）。
+    // 已经达标的保留 PASSED：达标是好源，改判 TIMEOUT 反而把它挡在本轮池外。
+    if timed_out && status != "PASSED" {
+        status = "TIMEOUT".into();
+    }
     // steps_ok：有书完整跑通四步即为 4；否则按命中书数给一个降级分（0..3）。
     let steps_ok = if chain_ok { 4 } else { std::cmp::min(3, n_hit) as u8 };
 
@@ -647,6 +722,19 @@ fn probe_source(
     let respond_ms = if probe_count > 0 { total_ms / probe_count as u64 } else { 0 };
     let (mut level, reasons) = judge_with_timeout(&host, &events, respond_ms, cfg);
     if level == "clean" && status == "PARTIAL" { level = "suspicious".into(); }
+
+    // fail_stage 决定下游日志的可读性；TIMEOUT 要能区分是单源超时还是整轮预算。
+    let fail_stage = if status == "TIMEOUT" {
+        format!("TIMEOUT:per_source:probed={}", probe_count)
+    } else if !gate_ok {
+        format!("SEARCH:{}", gate_status)
+    } else if !head_gate_ok {
+        format!("HEAD_GATE:head_pass={}<{}", head_pass, cfg.min_head_books)
+    } else if !chain_ok {
+        format!("CHAIN:n_hit={}<{}", n_hit, cfg.min_books_pass)
+    } else {
+        String::new()
+    };
 
     ProbeResult {
         source_id: sid,
@@ -659,15 +747,7 @@ fn probe_source(
         search_ok: gate_ok,
         search_status: gate_status.to_string(),
         search_detail: if gate_ok { "gate_ok".into() } else { gate.err.clone().unwrap_or_else(|| "gate_no_items".into()) },
-        fail_stage: if !gate_ok {
-            format!("SEARCH:{}", gate_status)
-        } else if !head_gate_ok {
-            format!("HEAD_GATE:head_pass={}<{}", head_pass, cfg.min_head_books)
-        } else if !chain_ok {
-            format!("CHAIN:n_hit={}<{}", n_hit, cfg.min_books_pass)
-        } else {
-            String::new()
-        },
+        fail_stage,
         respond_time_ms: respond_ms,
         probe_count,
         book_source_name_camel: source.book_source_name.clone(),
@@ -693,7 +773,7 @@ fn probe_source(
 fn parse_args() -> (String, String, String, Config) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2]");
+        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--read-timeout-secs N] [--per-source-secs N] [--global-budget-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2]");
         std::process::exit(2);
     }
     let mut cfg = Config::default();
@@ -704,6 +784,9 @@ fn parse_args() -> (String, String, String, Config) {
         match key {
             "--concurrency" => cfg.concurrency = val.parse().unwrap_or(4),
             "--timeout-secs" => cfg.timeout_secs = val.parse().unwrap_or(12),
+            "--read-timeout-secs" => cfg.read_timeout_secs = val.parse().unwrap_or(15),
+            "--per-source-secs" => cfg.per_source_secs = val.parse().unwrap_or(75),
+            "--global-budget-secs" => cfg.global_budget_secs = val.parse().unwrap_or(900),
             "--min-chapters" => cfg.min_chapters = val.parse().unwrap_or(3),
             "--min-content-chars" => cfg.min_content_chars = val.parse().unwrap_or(500),
             "--min-books-pass" => cfg.min_books_pass = val.parse().unwrap_or(1),
@@ -718,6 +801,7 @@ fn parse_args() -> (String, String, String, Config) {
 
 fn main() {
     let (in_path, books_path, out_path, cfg) = parse_args();
+    let start = Instant::now();
 
     let raw = fs::read_to_string(&in_path).expect("读取 sources.json 失败");
     let recs: Vec<SourceRec> = match serde_json::from_str::<Vec<SourceRec>>(&raw) {
@@ -736,8 +820,13 @@ fn main() {
     eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={} 门禁头部>={}本 总命中>={}本",
         recs.len(), books.classic.len(), books.hot.len(), books.waist.len(), books.longtail.len(),
         cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_head_books, cfg.min_books_pass);
+    eprintln!("[probe-kernel] 超时策略：连接 {}s / 读 {}s / 单源 {}s / 整轮预算 {}s",
+        cfg.timeout_secs, cfg.read_timeout_secs, cfg.per_source_secs, cfg.global_budget_secs);
 
-    let http = Arc::new(HttpClient::new(cfg.timeout_secs, None).expect("初始化 HTTP 客户端失败"));
+    let http = Arc::new(
+        HttpClient::new_with_read_timeout(cfg.timeout_secs, cfg.read_timeout_secs, None)
+            .expect("初始化 HTTP 客户端失败"),
+    );
     let parser = Arc::new(RuleEngine::new().expect("初始化 RuleEngine 失败"));
     let out = Arc::new(Mutex::new(fs::File::create(&out_path).expect("创建输出失败")));
     let (sem_tx, sem_rx) = mpsc::channel::<()>();
@@ -756,6 +845,7 @@ fn main() {
     let handle = rt.handle().clone();
 
     let mut handles = Vec::new();
+    let n_timeout = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for rec in recs {
         let sem_rx = sem_rx.clone();
         let sem_tx = sem_tx.clone();
@@ -765,9 +855,21 @@ fn main() {
         let cfg = cfg.clone();
         let books = books.clone();
         let handle = handle.clone();
+        let n_timeout = n_timeout.clone();
         handles.push(std::thread::spawn(move || {
             let _permit = acquire_permit(&sem_rx, &sem_tx);
-            let result = probe_source(&rec, &books, &http, &handle, &parser, &cfg);
+            // 整轮预算耗尽后不再开探测：直接出一行 TIMEOUT 占位，保证 matrix
+            // 行数与 targets 对齐。排队等待 permit 的时间也算进预算，
+            // 因为墙钟就是这么流逝的。
+            let result = if start.elapsed() >= Duration::from_secs(cfg.global_budget_secs) {
+                timeout_result(&rec, "TIMEOUT:global_budget")
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(cfg.per_source_secs);
+                probe_source(&rec, &books, &http, &handle, &parser, &cfg, deadline)
+            };
+            if result.status == "TIMEOUT" {
+                n_timeout.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let line = serde_json::to_string(&result).expect("序列化结果失败");
             let mut f = out.lock().expect("输出锁被污染");
             writeln!(f, "{}", line).expect("写输出失败");
@@ -776,5 +878,10 @@ fn main() {
         }));
     }
     for h in handles { let _ = h.join(); }
-    eprintln!("[probe-kernel] 完成，输出 {}", out_path);
+    eprintln!(
+        "[probe-kernel] 完成，输出 {}；TIMEOUT={} 个（未算作失败，下一轮重测），总耗时 {}s",
+        out_path,
+        n_timeout.load(std::sync::atomic::Ordering::Relaxed),
+        start.elapsed().as_secs()
+    );
 }

@@ -230,6 +230,11 @@ def _recheck(st, rows, fail_limit, blocked_limit):
         if _row_ok(r):
             p["fail_streak"] = 0
             p["blocked_streak"] = 0
+        elif status == "TIMEOUT":
+            # 本轮没测完（撞单源 deadline 或整轮预算），既不算失败也不算通过：
+            # 不累计也不清零 streak，留给下一轮重测。
+            # 宁可多留一个坏源，也不能让慢好源连续两轮被超时截断就淘汰。
+            pass
         elif status == "BLOCKED":
             p["blocked_streak"] = p.get("blocked_streak", 0) + 1
             p["fail_streak"] = 0
@@ -280,6 +285,7 @@ def commit(run_id, fail_limit, blocked_limit):
     # 风险来源：matrix 的 risk_level（L4 行为观测）写回池内 history，取最近一次。
     is_adult, n_rules = _adult_blocker()
     risk_by_id = {r["source_id"]: r.get("risk_level") for r in rows}
+    status_by_id = {r["source_id"]: r.get("status") for r in rows}
     kept = []
     safety_removed = []
     for p in st["pool"]:
@@ -290,10 +296,13 @@ def commit(run_id, fail_limit, blocked_limit):
         else:
             # 只在本轮测到该源且有明确非 clean 判定时才移出；本轮没测到的保留不动。
             risk = risk_by_id.get(p["source_id"])
+            # TIMEOUT = 本轮没测完，不是判定结果：既不能更新轮次
+            # （否则下一轮会以为刚测过而跳过），也不能按 risk 移出池。
+            timed_out = status_by_id.get(p["source_id"]) == "TIMEOUT"
             # 本轮被复测到的池内源，登记轮次供 plan 轮转（避免每轮重复测同一批）。
-            if risk is not None:
+            if risk is not None and not timed_out:
                 p["last_checked_round"] = st["round"]
-            reason = ("risk_filter:" + str(risk)) if risk is not None and risk != "clean" else None
+            reason = ("risk_filter:" + str(risk)) if (risk is not None and not timed_out and risk != "clean") else None
         if reason:
             st["retired"][p["source_id"]] = {
                 "reason": reason, "name": p.get("bookSourceName"),
