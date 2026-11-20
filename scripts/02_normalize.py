@@ -72,7 +72,11 @@ def is_blacklisted(domain, seeds):
 
 
 # 分组标签里的成人标记——只对 bookSourceGroup 判定，避免误伤正文小说
-WEAK_GROUP = re.compile(r"涩|🔞|成人|r18|敏感资源", re.I)
+# 说明：按分隔符拆成单个标签后逐条判定，命中任一标签即整条源剔除（组级整组剔除）。
+WEAK_GROUP = re.compile(r"涩|🔞|成人|r18|敏感资源|绅士|刘备|里番|禁书|肉文|po18|海棠|废文", re.I)
+# 独立短标签：必须整标签相等，避免 H 误伤 HTML/HD、18 误伤 1800
+EXACT_GROUP = {"h", "h+sp", "hsp", "18", "18+", "18禁", "r18", "成人"}
+GROUP_SEP = re.compile(r"[,，;；|/、\s]+")
 
 
 def load_adult_patterns():
@@ -87,16 +91,26 @@ def load_adult_patterns():
 
 
 def is_adult(s, pats):
-    """(是否成人源, 命中证据)。名称+URL 命中强规则，或分组命中弱规则。"""
+    """(是否成人源, 命中证据)。名称+URL 命中强规则，或分组命中弱规则。
+
+    分组按分隔符拆成单个标签逐条判定：任一标签命中成人标记，整条源即剔除。
+    """
     blob = (str(s.get("bookSourceName", "") or "") + " " +
             str(s.get("bookSourceUrl", "") or "")).lower()
     for p in pats:
         if re.search(p, blob, re.I):
             return True, "adult_pattern:" + p
     grp = str(s.get("bookSourceGroup", "") or "")
-    m = WEAK_GROUP.search(grp)
-    if m:
-        return True, "adult_group:" + m.group(0)
+    if grp:
+        for tag in GROUP_SEP.split(grp):
+            tag = tag.strip()
+            if not tag:
+                continue
+            if tag.lower() in EXACT_GROUP:
+                return True, "adult_group:" + tag
+            m = WEAK_GROUP.search(tag)
+            if m:
+                return True, "adult_group:" + m.group(0)
     return False, ""
 
 

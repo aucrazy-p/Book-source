@@ -19,7 +19,7 @@ powen
 r18
 18禁
 porn
-xxx
+(?<![a-z])xxx(?![a-z])
 福利姬
 涩涩
 

@@ -29,11 +29,14 @@ from urllib.request import Request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-from lib import SYSTEM_OPENER, UA, decode_body, dump_json, run_dir
+from lib import SYSTEM_OPENER, UA, decode_body, dump_json, run_dir, source_id
 
 # 候选种子兜底：上游采集全失败（如 GitHub Actions 机房 IP 被 yiove 403）时，
 # 用上次成功快照的 gzip 种子继续跑，避免池空转。种子只做兜底，正常采集优先。
 SEED_PATH = os.path.join(ROOT, "conf", "candidate_seed.json.gz")
+# yckceo 精选源静态基线：一次性采集后提交仓库，每轮直接读，不重抓。
+# 由 scripts/collect_yckceo.py 生成；文件不存在时合并逻辑自动跳过（零影响）。
+YCK_BASELINE = os.path.join(ROOT, "conf", "yck_baseline.json.gz")
 
 API = "https://shuyuan-api.yiove.com"
 COLS = API + "/shuyuan/book-source-collections"
@@ -92,6 +95,88 @@ def load_seed():
     except Exception as e:
         meta["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
         return [], meta
+
+
+def dedupe_by_source_id(sources, log=print):
+    """按 source_id 去重，合并「同站换皮包」。
+
+    上游合集里大量存在同站不同署名的重复打包（URL 尾部只差 #妍希 / #md 之类），
+    normalize_url 会把它们归一到同一个 source_id。不合并的话探测预算会浪费在
+    同一个站上——实测 yiove 1740 条里有 681 条属此类（占 39%）。
+
+    保留先出现者：合集按 view_total 降序排列，靠前的合集质量更好。
+    返回 (去重后列表, [(被丢弃的源, 证据)])；无 URL 的条目原样保留、不参与去重。
+    """
+    seen, out, dropped = {}, [], []
+    for s in sources:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        url = str(s.get("bookSourceUrl") or "").strip()
+        if not url:
+            out.append(s)            # 无 URL 无法判定同一性，不丢数据
+            continue
+        key = source_id(url)
+        prev = seen.get(key)
+        if prev is not None:
+            dropped.append((s, "same_source_id:%s~%s" % (
+                str(prev.get("bookSourceName") or "")[:16],
+                str(s.get("bookSourceName") or "")[:16])))
+            continue
+        seen[key] = s
+        out.append(s)
+    if dropped:
+        log("[采集] 按 source_id 去重 -%d 条（同站换皮，保留先出现者）" % len(dropped))
+    return out, dropped
+
+
+def merge_yck_baseline(sources, baseline_path=None, log=print):
+    """把 yckceo 静态基线并入候选源列表，按 source_id 去重。
+
+    基线缺失/损坏一律不报错、原样返回 —— 这是可选增强，不能成为采集的单点故障。
+    返回 (新列表, meta)；meta 进 provenance，带基线 sha256 便于溯源。
+    """
+    path = baseline_path or YCK_BASELINE
+    meta = {"kind": "yck_baseline", "path": path,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "baseline_count": 0, "added": 0, "overlap": 0}
+    if not os.path.exists(path):
+        meta["error"] = "baseline missing"
+        return sources, meta
+    try:
+        with gzip.open(path, "rb") as f:
+            obj = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        meta["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        return sources, meta
+
+    rows = obj.get("sources", []) if isinstance(obj, dict) else []
+    if isinstance(obj, dict):
+        meta["sha256"] = obj.get("sha256", "")
+        meta["collected_at"] = obj.get("collected_at", "")
+    meta["baseline_count"] = len(rows)
+
+    seen = {source_id(s.get("bookSourceUrl") or "") for s in sources}
+    out = list(sources)
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        key = source_id(s.get("bookSourceUrl") or "")
+        if not key:
+            continue
+        if key in seen:
+            meta["overlap"] += 1
+            continue
+        seen.add(key)
+        s = dict(s)
+        s["_upstream"] = "yckceo:baseline"
+        s["_is_valid"] = True
+        out.append(s)
+        meta["added"] += 1
+    meta["total"] = len(out)
+    log("[采集] 合并 yckceo 基线 +%d 条（基线 %d / 重叠 %d）"
+        % (meta["added"], meta["baseline_count"], meta["overlap"]))
+    return out, meta
 
 
 def collect(run_id, n_cols, n_single, pages):
@@ -164,6 +249,19 @@ def collect(run_id, n_cols, n_single, pages):
                   % (len(sources), seed_meta.get("collected_at", "?")))
         else:
             print("[采集] 上游 0 条，且种子不可用：%s" % seed_meta.get("error", "未知"))
+
+    # 3) 按 source_id 去重：合并同站换皮包（与第 1 步的 URL 精确去重是两回事）
+    n_before = len(sources)
+    sources, dup_dropped = dedupe_by_source_id(sources)
+    provenance.append({"kind": "dedupe_source_id", "before": n_before,
+                       "after": len(sources), "dropped": len(dup_dropped),
+                       "samples": [ev for _, ev in dup_dropped[:10]]})
+
+    # 4) 合并 yckceo 静态基线（本地文件，不联网；缺失则自动跳过）
+    sources, yck_meta = merge_yck_baseline(sources)
+    provenance.append(yck_meta)
+    if yck_meta.get("added"):
+        strategy += "+yck_baseline"
 
     payload = {
         "run_id": run_id,
