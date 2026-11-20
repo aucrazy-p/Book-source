@@ -39,6 +39,16 @@ class TestAdultGroup(unittest.TestCase):
     def test_group_h_alone(self):
         self.assertTrue(adult("H"), "独立标签 H 应判成人")
 
+    def test_group_huangshu(self):
+        """「皇叔」是网文圈对成人内容的代称，组标签命中即整组剔除。"""
+        self.assertTrue(adult("皇叔"))
+        self.assertTrue(adult("皇叔,小说"))
+        self.assertTrue(adult("免费 皇叔"))
+
+    def test_huangshu_not_matched_as_substring_of_normal_word(self):
+        """只按整标签相等判定，避免把含「皇叔」二字的正常标签误伤。"""
+        self.assertFalse(adult("皇叔推荐位A"), "非整标签不应命中")
+
     def test_group_h_plus_sp(self):
         self.assertTrue(adult("H+SP"))
 
