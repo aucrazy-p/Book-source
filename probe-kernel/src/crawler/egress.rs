@@ -118,6 +118,26 @@ pub fn adopt_ctx(snap: &SourceCtxSnapshot) {
     });
 }
 
+/// 在本线程临时装入快照执行 f，结束后恢复原上下文。
+///
+/// 供 `JsThreadContext::replay` 用：TOC 并行的子线程求值期间需要父线程的声明域，
+/// 但求值完必须恢复原 ctx —— 同一工作线程后续还要处理别的源，不恢复会串味。
+/// snap=None 时装入 default（initialized=false）→ check 走「未登记放行」兜底。
+pub fn with_ctx<F, T>(snap: Option<&SourceCtxSnapshot>, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    // 先 clone 出 saved，确保 borrow() 在 adopt_ctx 的 borrow_mut() 之前释放。
+    let saved = CTX.with(|c| c.borrow().clone());
+    match snap {
+        Some(s) => adopt_ctx(s),
+        None => CTX.with(|c| *c.borrow_mut() = SourceCtx::default()),
+    }
+    let result = f();
+    CTX.with(|c| *c.borrow_mut() = saved);
+    result
+}
+
 /// 子线程结束前调用：取走本线程拦截记录，由父线程归并（否则 take_blocked 收不到）。
 pub fn drain_blocked() -> Vec<BlockedHost> {
     take_blocked()
@@ -443,5 +463,30 @@ mod tests {
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].action, "would_block");
         assert_eq!(blocked[0].tier, 3);
+    }
+
+    // TOC 跨线程缺口：子线程 replay 时用 with_ctx 装入父线程快照，
+    // 判定须按快照的声明域生效，退出后须恢复原上下文（不污染下一源）。
+    #[test]
+    fn with_ctx_restores_prior_context() {
+        setup(POLICY_JSON, "fullblock", &["site.com"], "src0", false);
+        let snap = snapshot_ctx(); // 声明域 site.com / fullblock
+        let inside = with_ctx(Some(&snap), || {
+            // 子作用域按快照判定：evil.com 带 cookie → 拦
+            check("https://evil.com/collect", "GET", false, &["Cookie".to_string()])
+        });
+        assert_eq!(inside, Decision::Block);
+        // 退出后必须恢复主线程的 site.com 声明域：site.com 仍放行
+        assert_eq!(check("https://site.com/x", "GET", false, &[]), Decision::Allow);
+    }
+
+    #[test]
+    fn with_ctx_none_falls_back_to_default() {
+        setup(POLICY_JSON, "fullblock", &["site.com"], "src0", false);
+        let r = with_ctx(None, || {
+            // 传 None → 装入 default（initialized=false）→ check 一律放行兜底
+            check("https://evil.com/collect", "POST", true, &["Cookie".to_string()])
+        });
+        assert_eq!(r, Decision::Allow);
     }
 }
