@@ -206,6 +206,9 @@ jobs:
           if git diff --cached --quiet; then
             echo "sources.json 内容无变化，跳过 commit（避免无意义提交）"
           else
+            # 书源确有变更：同步写入更新时间戳，供 Pages 统计区读取
+            python3 -c "import json,datetime;json.dump({'updated':datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')},open('docs/meta.json','w'))"
+            git add docs/meta.json
             git commit -m "chore: 自动更新书源 ($(date -u +%Y-%m-%d))"
             git push origin HEAD:main
             echo "::notice::已发布 sources.json 到 docs/，Pages 将自动重建"

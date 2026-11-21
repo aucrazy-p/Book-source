@@ -310,13 +310,19 @@ function render(){
   }).join('');
 }
 
-/* 线上读取同目录 sources.json；失败则用种子数据 */
+/* 线上读取同目录 sources.json / meta.json；失败则用种子数据。
+   两个源全部到齐后再一次性渲染，避免先画种子数据造成的数字闪烁。 */
 async function boot(){
-  initStats();render();
+  // 两个源各自 try：meta.json 是可选日期，抖动不能连累核心的 sources.json
   try{
     const res=await fetch('sources.json',{cache:'no-store'});
-    if(res.ok){const data=await res.json();if(Array.isArray(data)&&data.length){SOURCES=data;initStats();render()}}
+    if(res.ok){const data=await res.json();if(Array.isArray(data)&&data.length) SOURCES=data;}
   }catch(e){/* file:// 下 CORS 失败，用种子数据即可 */}
+  try{
+    const res=await fetch('meta.json',{cache:'no-store'});
+    if(res.ok){const meta=await res.json();if(meta&&meta.updated) UPDATE_DATE=meta.updated;}
+  }catch(e){/* meta 缺失/异常保留种子日期，不影响书源 */}
+  initStats();render();
 }
 boot();
 </script>
