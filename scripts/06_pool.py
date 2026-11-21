@@ -39,6 +39,36 @@ from lib import (dump_json, dump_jsonl, load_json, load_jsonl,
 POOL_SIZE = 50
 FAIL_LIMIT = 2      # 连续 FAILED 达此值移出（真失效）
 BLOCKED_LIMIT = 3   # 连续 BLOCKED 达此值移出（机房 IP 长期连不上，等价于不可用）
+# 搜索污染率门禁（用户 2026-11-21 确认）：no_title_match 占比 ≥25% 判不合格。
+# 挡住"多数书命中、招牌书全是同人/错书"的站（如 sou78 47%）。严格不等号：达到即淘汰。
+MISMATCH_LIMIT = 0.25
+
+
+def mismatch_rate(r):
+    """搜索污染率 = no_title_match 失败本数 / 实际探测本数。
+
+    数据源为 matrix 行已有的 steps[*].stage（main.rs 透传，无需改 Rust）与
+    attempts。steps 只记失败步骤，stage 前缀 SEARCH_PARSE:no_title_match 即
+    「搜到了但书名/作者校验失败」。分母 ≤0（gate 阶段就失败）时返回 0.0，
+    交由 search_ok/PASSED 门禁处理，不在本函数除零。
+    """
+    steps = r.get("steps") or {}
+    nom = sum(1 for v in steps.values()
+              if str(v.get("stage", "")).startswith("SEARCH_PARSE:no_title_match"))
+    attempts = sum((r.get("attempts") or {}).values())
+    return nom / attempts if attempts > 0 else 0.0
+
+
+def should_retire_by_mismatch(p, row):
+    """存量池源是否因搜索污染率超标立即剔除。
+
+    条件：本轮测到该源（row 非 None）、status 不是 TIMEOUT（没测完不判）、
+    且污染率 ≥ 阈值。独立于白名单误伤守卫——高污染且 blocked 非空仍剔除
+    （用户"宁可错杀"）。p 仅为接口对称保留，判定只依赖 row。
+    """
+    if row is None or row.get("status") == "TIMEOUT":
+        return False
+    return mismatch_rate(row) >= MISMATCH_LIMIT
 
 # 成人过滤规则单一真值：复用 02_normalize 的 load_adult_patterns/is_adult。
 # 用 importlib 按路径加载（文件名以数字开头，不能用常规 import）。
@@ -177,8 +207,11 @@ def plan(run_id, size):
 def _row_ok(r):
     # 与 04_select 同口径：只有 clean 源能进池/算合格。
     # quarantine（L4 观测到 java.* 危险调用）/suspicious 一律不许入池。
+    # 搜索污染率门禁（2026-11-21）：no_title_match 占比 ≥25% 一票否决，
+    # 挡住"命中够数但招牌书全是同人"的站。
     return (r.get("search_ok") is True and r.get("status") == "PASSED"
-            and r.get("risk_level") == "clean")
+            and r.get("risk_level") == "clean"
+            and mismatch_rate(r) < MISMATCH_LIMIT)
 
 
 def _merge_new(st, rows, by_id, size):
@@ -300,6 +333,7 @@ def commit(run_id, fail_limit, blocked_limit):
     is_adult, n_rules = _adult_blocker()
     risk_by_id = {r["source_id"]: r.get("risk_level") for r in rows}
     status_by_id = {r["source_id"]: r.get("status") for r in rows}
+    rows_by_id = {r["source_id"]: r for r in rows}
     # 出口白名单拦截记录（方案 §5 误伤发现）：只有**真实拦截**（action=blocked）
     # 才能触发误伤守卫。observe 阶段所有记录都是 would_block，且陌生域 GET（第 3 档）
     # 几乎每源都有——若把 would_block 也算，任何 risk 非 clean 的源都会被守卫保留，
@@ -345,6 +379,14 @@ def commit(run_id, fail_limit, blocked_limit):
                 guard_blocks.append((p.get("bookSourceName"), reason,
                                      len(blocked_by_id[p["source_id"]])))
                 reason = None
+
+            # 搜索污染率门禁（2026-11-21，用户"宁可错杀"）：独立于白名单误伤守卫——
+            # 即使上面因 blocked 被守卫清空 reason，高污染仍一票否决剔除。
+            # TIMEOUT / 本轮未测到（row=None）不判，由 should_retire_by_mismatch 保证。
+            row = rows_by_id.get(p["source_id"])
+            if should_retire_by_mismatch(p, row):
+                reason = "mismatch_filter:%.0f%%>=%.0f%%" % (
+                    mismatch_rate(row) * 100, MISMATCH_LIMIT * 100)
         if reason:
             st["retired"][p["source_id"]] = {
                 "reason": reason, "name": p.get("bookSourceName"),
@@ -359,10 +401,11 @@ def commit(run_id, fail_limit, blocked_limit):
         # 分开统计命中原因：成人规则命中的是源，n_rules 只是规则库规模，
         # 混在一句里容易被误读成"移出 N 个成人源"（历史日志就出现过这个歧义）。
         n_adult = sum(1 for _, r in safety_removed if r.startswith("adult_filter:"))
-        n_risk = len(safety_removed) - n_adult
-        print("[池] 二次安全过滤：移出 %d 个（成人规则命中 %d 个 / risk 过滤 %d 个；"
-              "规则库 %d 条），池内剩 %d"
-              % (len(safety_removed), n_adult, n_risk, n_rules, len(st["pool"])))
+        n_mismatch = sum(1 for _, r in safety_removed if r.startswith("mismatch_filter:"))
+        n_risk = len(safety_removed) - n_adult - n_mismatch
+        print("[池] 二次安全过滤：移出 %d 个（成人规则命中 %d 个 / 污染率超标 %d 个 / "
+              "risk 过滤 %d 个；规则库 %d 条），池内剩 %d"
+              % (len(safety_removed), n_adult, n_mismatch, n_risk, n_rules, len(st["pool"])))
     if guard_blocks:
         print("[池] 出口白名单误伤守卫：%d 个源因 blocked_hosts 非空被保留（待人工核对）:"
               % len(guard_blocks))
