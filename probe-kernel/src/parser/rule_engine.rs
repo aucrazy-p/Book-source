@@ -2023,7 +2023,7 @@ fn eval_chapter_fields_parallel(
                 // 每个线程都要一份自己的上下文副本（闭包里按引用借用）。
                 let context = thread_context.clone();
                 scope.spawn(move || {
-                    context.replay(|| {
+                    let chapters = context.replay(|| {
                         // 每个线程独立的 @put/@get 状态。
                         //
                         // 串行版本跨 item 共享同一个 ctx，理论上书源可以用
@@ -2035,15 +2035,23 @@ fn eval_chapter_fields_parallel(
                             .iter()
                             .map(|item| eval_chapter_fields(rule, item, base_url, &mut ctx))
                             .collect::<Vec<_>>()
-                    })
+                    });
+                    // 出口白名单：子线程求值期间的拦截记录写在本线程 BLOCKED，
+                    // 主线程 take_blocked 读不到 —— 取出来随结果返回，由父线程归并。
+                    let blocked = crate::crawler::egress::drain_blocked();
+                    (chapters, blocked)
                 })
             })
             .collect();
         for handle in handles {
             match handle.join() {
-                Ok(part) => parts.push(part),
+                Ok((part, blocked)) => {
+                    crate::crawler::egress::merge_blocked(blocked);
+                    parts.push(part);
+                }
                 // 某块求值 panic 时不能让整次目录解析跟着炸：丢掉该块即可，
                 // 上层会看到章节数偏少，而不是「打开书直接失败」。
+                // 注意：panic 子线程的 BLOCKED 随线程退出丢失，但那本就是异常路径。
                 Err(_) => parts.push(Vec::new()),
             }
         }
