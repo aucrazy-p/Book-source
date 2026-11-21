@@ -469,15 +469,20 @@ mod tests {
     // 判定须按快照的声明域生效，退出后须恢复原上下文（不污染下一源）。
     #[test]
     fn with_ctx_restores_prior_context() {
-        setup(POLICY_JSON, "fullblock", &["site.com"], "src0", false);
-        let snap = snapshot_ctx(); // 声明域 site.com / fullblock
+        setup(POLICY_JSON, "fullblock", &["snap.com"], "src0", false);
+        let snap = snapshot_ctx(); // 快照声明域 = snap.com
+        // 把主线程 CTX 换成另一个声明域，使 saved(main.com) ≠ snap(snap.com)。
+        // 这样退出后的断言才能真正检测到"有没有恢复"：
+        // 若 with_ctx 未恢复（CTX 仍是 snap.com），退出后 snap.com 会被当声明域放行 → 测试失败。
+        begin_source(vec!["main.com".to_string()], "src0".to_string(), false);
+        // 作用域内按快照判定：snap.com 是快照的声明域 → Allow
         let inside = with_ctx(Some(&snap), || {
-            // 子作用域按快照判定：evil.com 带 cookie → 拦
-            check("https://evil.com/collect", "GET", false, &["Cookie".to_string()])
+            check("https://snap.com/x", "GET", false, &[])
         });
-        assert_eq!(inside, Decision::Block);
-        // 退出后必须恢复主线程的 site.com 声明域：site.com 仍放行
-        assert_eq!(check("https://site.com/x", "GET", false, &[]), Decision::Allow);
+        assert_eq!(inside, Decision::Allow);
+        // 退出后必须按 main.com：snap.com 成陌生域 GET → 第 3 档 WouldBlock
+        assert_eq!(check("https://snap.com/x", "GET", false, &[]), Decision::WouldBlock);
+        assert_eq!(check("https://main.com/x", "GET", false, &[]), Decision::Allow);
     }
 
     #[test]
