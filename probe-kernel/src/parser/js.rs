@@ -310,6 +310,9 @@ pub struct JsThreadContext {
     book: Option<JsBookContext>,
     http: Option<SourceHttpContext>,
     search: Option<(String, i32)>,
+    /// 出口白名单上下文快照：TOC 并行的子线程求值时会发 JS 请求，
+    /// 必须继承父线程的声明域，否则 egress::check 读到空 ctx 直接放行（绕过口）。
+    egress: Option<crate::crawler::egress::SourceCtxSnapshot>,
 }
 
 impl JsThreadContext {
@@ -322,6 +325,7 @@ impl JsThreadContext {
             book: ACTIVE_BOOK_CTX.with(|cell| cell.borrow().clone()),
             http: ACTIVE_HTTP.with(|cell| cell.borrow().clone()),
             search: ACTIVE_SEARCH.with(|cell| cell.borrow().clone()),
+            egress: Some(crate::crawler::egress::snapshot_ctx()),
         }
     }
 
@@ -331,12 +335,23 @@ impl JsThreadContext {
     /// 日志与副作用队列（`JS_LOGS`、`EXPLORE_INTENTS` 等）故意不重放 ——
     /// 它们属于产生它们的那个线程，跨线程搬运反而会串味。
     pub fn replay<T>(self, f: impl FnOnce() -> T) -> T {
-        with_thread_local(&ACTIVE_SOURCE, self.source, || {
-            with_thread_local(&ACTIVE_JS_LIB, self.js_lib, || {
-                with_thread_local(&ACTIVE_BOOK_URL, self.book_url, || {
-                    with_thread_local(&ACTIVE_BOOK_CTX, self.book, || {
-                        with_thread_local(&ACTIVE_HTTP, self.http, || {
-                            with_thread_local(&ACTIVE_SEARCH, self.search, f)
+        // 先把 egress 取出（其余字段要 move 进嵌套闭包），用 with_ctx 在最外层
+        // 装入/恢复出口白名单上下文：子线程求值期间 check 能看到父线程声明域。
+        let egress = self.egress;
+        let source = self.source;
+        let js_lib = self.js_lib;
+        let book_url = self.book_url;
+        let book = self.book;
+        let http = self.http;
+        let search = self.search;
+        crate::crawler::egress::with_ctx(egress.as_ref(), || {
+            with_thread_local(&ACTIVE_SOURCE, source, || {
+                with_thread_local(&ACTIVE_JS_LIB, js_lib, || {
+                    with_thread_local(&ACTIVE_BOOK_URL, book_url, || {
+                        with_thread_local(&ACTIVE_BOOK_CTX, book, || {
+                            with_thread_local(&ACTIVE_HTTP, http, || {
+                                with_thread_local(&ACTIVE_SEARCH, search, f)
+                            })
                         })
                     })
                 })
