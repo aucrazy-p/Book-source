@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "_note": "出口白名单跨源共享策略。平台域/托管域只按后缀识别类别，绝不按 eTLD+1 放行；托管域必须逐 host 精确匹配（见方案 §3.2 反例 skybook.pages.dev）。新增手工放行写 manual_allow[source_id]，下一轮生效，无需重建。",
+  "platforms": [
+    "qq.com",
+    "baidu.com",
+    "gitee.com",
+    "github.com",
+    "weixin.qq.com",
+    "qlogo.cn",
+    "gtimg.com"
+  ],
+  "hosted_suffixes": [
+    "github.io",
+    "pages.dev",
+    "vercel.app",
+    "netlify.app",
+    "workers.dev",
+    "web.app",
+    "firebaseapp.com"
+  ],
+  "manual_allow": {}
+}

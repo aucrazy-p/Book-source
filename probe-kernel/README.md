@@ -33,4 +33,20 @@
 
 1. 当前 main 只跑搜索步；方案 §17.1 A-1 的四步链路（搜索→详情→目录→正文）尚未全接，留待编译通过后在 main 里用 parser 规则引擎逐段补齐。
 2. `eval_js_search_with_source` 的 script 参数需要的是 JS 规则文本，`search_url` 可能是 URL 模板——运行正确性待实测，首版目标先是编译通过 + hook 工作。
-3. 容器层 `docker run` 的资源限制（内存/PID/超时/网络白名单，方案 §11）在 workflow 里配，不在本 crate 内。
+3. 容器层 `docker run` 的资源限制（内存/PID/超时，方案 §11）在 workflow 里配，不在本 crate 内。
+   **网络不做容器级白名单**：书源域名每源不同且会换，docker 层拿不到 source_id，做不到动态白名单。
+   出口由内核层 host 策略管控（`crawler/egress.rs`，见方案 §3）——唯一出网函数
+   `js_request_with_bytes` 在发请求前查策略，JS 无第二条出网通道可绕过。
+
+## 出口白名单（方案 §3）
+
+- 唯一出网口 `js_request_with_bytes`：所有 `ajax`/`connect`/`ajaxAll`/字节路径汇流于此，
+  策略查询在真正发请求前执行。Rust 侧不硬编码任何域名。
+- 数据来源运行时注入：`probe_input.json` 每源的 `declared_hosts`（Python 静态提取），
+  平台域/托管域/手工放行来自 `--host-policy <path>`（CI 挂载 `runs/ci/host_policy.json`）。
+- 模式由环境变量 `PROBE_EGRESS_MODE` 控制：`observe`（默认，只记 would_block 不拦）/
+  `semiblock`（拦陌生域带数据）/ `fullblock`（全量四档）。
+- 新源首轮、content_hash 变更源强制 observe 一轮。托管后缀（pages.dev 等）只识别类别，
+  必须逐 host 精确匹配，绝不按 eTLD+1 放行。
+- 误伤回滚：`PROBE_EGRESS_MODE=observe` 一键回退；单源放行写 `conf/host_policy.json`
+  的 `manual_allow[source_id]`，下一轮生效，无需重建。

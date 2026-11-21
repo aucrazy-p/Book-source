@@ -8,6 +8,13 @@ on:
     # UTC 16:23 = 北京时间 00:23，避开整点拥塞（cron 在 UTC，整点易延迟/丢弃）
     - cron: '23 16 * * *'
   workflow_dispatch:
+    inputs:
+      egress_mode:
+        description: '出口白名单模式：observe(只记不拦) / semiblock(拦陌生域带数据) / fullblock(全量四档)'
+        required: false
+        default: 'observe'
+        type: choice
+        options: [observe, semiblock, fullblock]
 
 permissions:
   contents: write  # 发布 sources.json 回本仓库 docs/（GITHUB_TOKEN push，不触发新 workflow）
@@ -23,6 +30,8 @@ jobs:
     timeout-minutes: 45
     env:
       LEGADO_SY_RUNS_DIR: ${{ github.workspace }}/runs
+      # 灰度阶段由 dispatch 输入决定；定时触发恒为 observe（最安全）。
+      PROBE_EGRESS_MODE: ${{ inputs.egress_mode || 'observe' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,9 +109,11 @@ jobs:
           timeout --signal=TERM --kill-after=30s 1800s \
           docker run --rm --name probe-sandbox-run \
             --read-only \
+            --cap-drop=ALL --security-opt=no-new-privileges --user 10001:10001 \
             --tmpfs /tmp:rw,nosuid,size=256m \
             --tmpfs /home/probe:rw,nosuid,size=64m \
             --memory=2g --memory-swap=2g --cpus=2 --pids-limit=512 \
+            -e PROBE_EGRESS_MODE="${PROBE_EGRESS_MODE:-observe}" \
             -v "$PWD/bin/probe-kernel:/usr/local/bin/probe-kernel:ro" \
             -v "$PWD/runs:/work/runs:rw" \
             probe-sandbox \
@@ -112,7 +123,8 @@ jobs:
             --concurrency 4 --timeout-secs 12 \
             --read-timeout-secs 15 --per-source-secs 75 --global-budget-secs 900 \
             --min-chapters 3 --min-content-chars 500 \
-            --min-books-pass 1 --min-head-books 1
+            --min-books-pass 1 --min-head-books 1 \
+            --host-policy /work/runs/ci/host_policy.json
           docker rm -f probe-sandbox-run 2>/dev/null || true
           python3 - <<'PY'
           import json, collections

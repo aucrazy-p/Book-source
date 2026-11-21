@@ -1,3 +1,4 @@
+pub mod egress;
 pub mod fetcher;
 pub mod http_client;
 pub mod source_session;

@@ -121,10 +121,19 @@ jobs:
         run: cargo build --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl
 
       - name: Smoke test (unit tests)
-        # 跑 behavior 判定单测，验证 L4 hook 逻辑（不联网）
+        # 跑 behavior 判定 + 出口白名单策略单测（不联网）。
+        # 注意 egress 单测用 OnceLock，进程内只设一次，需分两个测试进程跑：
+        # 先 behavior，再 egress（各自独立二进制实例）。
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl behavior::tests -- --nocapture
+        run: |
+          cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl behavior::tests -- --nocapture
+          # egress 单测要逐例切 MODE（全局 RwLock），必须串行跑，否则并行互相覆盖
+          cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl crawler::egress::tests -- --nocapture --test-threads=1
+
+      - name: Smoke test (egress injection, Python)
+        # 出口白名单的 Python 侧注入单测（纯标准库，不联网）：declared_hosts 提取 / is_new。
+        run: python3 -m unittest tests.test_egress_input -v
 
       - name: Smoke test (four-step probe)
         # 用刚编译的二进制对线上 9 源跑一次四步探测（联网），验证 CLI 运行期正确。

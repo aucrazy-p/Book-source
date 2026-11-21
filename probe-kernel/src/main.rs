@@ -14,6 +14,10 @@
 //!   --min-books-pass N     PASSED 门槛：至少 N 本书跑通四步，默认 1
 //!   --min-head-books N     头部门槛：classic+hot 至少 N 本四步全过，默认 1（见 §17.1 B-2）
 //!   --host-whitelist h1,h2 允许跨域的目标主机
+//!   --host-policy <path>  出口白名单策略文件（平台域/托管域/手工放行）；不传则仅用声明域
+//!
+//! 出口白名单模式由环境变量 PROBE_EGRESS_MODE 控制（observe / semiblock / fullblock）：
+//! 默认 observe——只记 would_block 不拦任何请求。新源首轮、内容变更源强制 observe 一轮。
 //!
 //! 判定口径（方案 §17.1）：
 //!   - 命中 = RuleEngine 从响应解析出真实结构化条目，不是字符串包含
@@ -91,6 +95,12 @@ struct SourceRec {
     source_id: String,
     #[serde(default)]
     content_hash: String,
+    /// 本源声明可达的 host（由 make_probe_input.py 静态提取，运行时注入，不硬编码）。
+    #[serde(default)]
+    declared_hosts: Vec<String>,
+    /// 新源首轮 / 内容变更源：强制 observe 一轮，只记不拦。
+    #[serde(default)]
+    is_new: bool,
     source: BookSource,
 }
 
@@ -152,6 +162,9 @@ struct ProbeResult {
     behavior_events: Vec<behavior::BehaviorEvent>,
     behavior_level: String,
     behavior_reasons: Vec<String>,
+    /// 出口白名单拦截记录（观察模式下为 would_block）。供 daily 日志汇总误伤。
+    #[serde(default)]
+    blocked_hosts: Vec<probe_kernel::crawler::egress::BlockedHost>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +191,8 @@ struct Config {
     /// 故按方案原意「头部排除坏源」改为本数门槛。设为 0 关闭。
     min_head_books: u32,
     host_whitelist: Vec<String>,
+    /// 出口白名单策略文件路径（可选）。
+    host_policy: Option<String>,
 }
 
 impl Default for Config {
@@ -193,6 +208,7 @@ impl Default for Config {
             min_books_pass: 1,
             min_head_books: 1,
             host_whitelist: Vec::new(),
+            host_policy: None,
         }
     }
 }
@@ -597,6 +613,7 @@ fn timeout_result(rec: &SourceRec, fail_stage: &str) -> ProbeResult {
         behavior_events: Vec::new(),
         behavior_level: "unknown".into(),
         behavior_reasons: vec!["global_budget_exhausted".into()],
+        blocked_hosts: Vec::new(),
     }
 }
 
@@ -617,6 +634,9 @@ fn probe_source(
     let sid = if rec.source_id.trim().is_empty() { source_id(&url) } else { rec.source_id.clone() };
 
     behavior::begin();
+    // 出口白名单：登记本源声明域到 thread_local（同线程内的 JS 请求可见）。
+    // 声明域由 make_probe_input.py 静态提取；is_new 由 06_pool.plan 标记。
+    probe_kernel::crawler::egress::begin_source(rec.declared_hosts.clone(), sid.clone(), rec.is_new);
     // 跨平台 JS 持久化目录（Windows 本机调试 / Linux CI 通用），用完即弃。
     let js_dir = std::env::temp_dir().join("probe-js-store");
     let _ = std::fs::create_dir_all(&js_dir);
@@ -717,6 +737,14 @@ fn probe_source(
     let steps_ok = if chain_ok { 4 } else { std::cmp::min(3, n_hit) as u8 };
 
     let events = behavior::take();
+    let blocked_hosts = probe_kernel::crawler::egress::take_blocked();
+    if !blocked_hosts.is_empty() {
+        let n_blocked = blocked_hosts.iter().filter(|b| b.action == "blocked").count();
+        let n_would = blocked_hosts.len() - n_blocked;
+        eprintln!("[egress] {} mode={} 拦截={} 本可拦={} hosts={:?}",
+            sid, probe_kernel::crawler::egress::current_mode(), n_blocked, n_would,
+            blocked_hosts.iter().take(5).map(|b| b.host.as_str()).collect::<Vec<_>>());
+    }
     // 方案 §17.1 A-4：respond_time_ms > 5000 降级，用单源平均耗时，
     // 不是 total_ms（50 本书累计必然超 5s，会把所有源误降 suspicious）。
     let respond_ms = if probe_count > 0 { total_ms / probe_count as u64 } else { 0 };
@@ -765,6 +793,7 @@ fn probe_source(
         behavior_events: events,
         behavior_level: level.clone(),
         behavior_reasons: reasons,
+        blocked_hosts,
     }
 }
 
@@ -773,7 +802,7 @@ fn probe_source(
 fn parse_args() -> (String, String, String, Config) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--read-timeout-secs N] [--per-source-secs N] [--global-budget-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2]");
+        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--read-timeout-secs N] [--per-source-secs N] [--global-budget-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2] [--host-policy <path>]");
         std::process::exit(2);
     }
     let mut cfg = Config::default();
@@ -792,6 +821,7 @@ fn parse_args() -> (String, String, String, Config) {
             "--min-books-pass" => cfg.min_books_pass = val.parse().unwrap_or(1),
             "--min-head-books" => cfg.min_head_books = val.parse().unwrap_or(1),
             "--host-whitelist" => cfg.host_whitelist = val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
+            "--host-policy" => cfg.host_policy = Some(val.to_string()),
             _ => {}
         }
         i += 2;
@@ -803,6 +833,13 @@ fn main() {
     let (in_path, books_path, out_path, cfg) = parse_args();
     let start = Instant::now();
 
+    // 出口白名单：模式来自环境变量（默认 observe），策略文件可选。
+    // 必须在任何 JS 求值前初始化，否则 thread_local CTX 未登记，全部请求放行。
+    let egress_mode = env::var("PROBE_EGRESS_MODE").unwrap_or_default();
+    probe_kernel::crawler::egress::init(cfg.host_policy.as_deref(), &egress_mode);
+    eprintln!("[probe-kernel] 出口白名单模式={} 策略文件={:?}",
+        probe_kernel::crawler::egress::current_mode(), cfg.host_policy);
+
     let raw = fs::read_to_string(&in_path).expect("读取 sources.json 失败");
     let recs: Vec<SourceRec> = match serde_json::from_str::<Vec<SourceRec>>(&raw) {
         Ok(v) => v,
@@ -811,6 +848,8 @@ fn main() {
             arr.into_iter().map(|s| SourceRec {
                 source_id: String::new(),
                 content_hash: content_hash(&s),
+                declared_hosts: Vec::new(),
+                is_new: false,
                 source: s,
             }).collect()
         }

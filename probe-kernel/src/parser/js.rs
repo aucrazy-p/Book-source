@@ -5291,7 +5291,8 @@ fn js_request_with_bytes(
     if url.is_empty() {
         return json!({ "body": "", "code": 0, "url": "", "headers": {}, "call_time": 0 });
     }
-    let method = match method.to_ascii_uppercase().as_str() {
+    let method_str = method.to_ascii_uppercase();
+    let method = match method_str.as_str() {
         "POST" => HttpMethod::POST, "HEAD" => HttpMethod::HEAD,
         "PUT" => HttpMethod::PUT, "PATCH" => HttpMethod::PATCH,
         "DELETE" => HttpMethod::DELETE, _ => HttpMethod::GET,
@@ -5326,6 +5327,25 @@ fn js_request_with_bytes(
     let request_url = crate::crawler::url_analyzer::absolute_url(&source.url, &url);
     let proxy = merged.iter().find(|(key, _)| key.eq_ignore_ascii_case("proxy")).map(|(_, value)| value.clone());
     merged.retain(|(key, _)| !key.eq_ignore_ascii_case("proxy"));
+
+    // ---- 出口白名单策略检查（方案 §3）：全仓唯一出网口，JS 无法绕过 ----
+    // 必须在 run_blocking_http 起线程之前、用绝对 URL + 合并后请求头做判定。
+    // 观察模式（默认）只记 would_block，不拦任何请求；拦截时返回空响应信封，
+    // 同时由 behavior 记一条 L4_EGRESS_BLOCK，让 risk_level 落到 quarantine。
+    let has_body = body.as_ref().map(|b| !b.is_empty()).unwrap_or(false)
+        || body_bytes.as_ref().map(|b| !b.is_empty()).unwrap_or(false);
+    let header_names: Vec<String> = merged.iter().map(|(k, _)| k.clone()).collect();
+    let decision = crate::crawler::egress::check(&request_url, &method_str, has_body, &header_names);
+    if decision == crate::crawler::egress::Decision::Block {
+        crate::behavior::record(
+            "java.egress_block", Some(request_url.clone()), Some(method_str.clone()),
+            None, Some(crate::crawler::egress::current_mode().to_string()),
+        );
+        return json!({
+            "body": "", "code": 0, "url": request_url,
+            "headers": {}, "call_time": 0, "egress_blocked": true,
+        });
+    }
     // 默认跟随重定向; `java.get/head/post` 显式关掉(legado
     // `Jsoup.connect(...).followRedirects(false)`, 见 `js_http_with_redirect`)。
     // 这个开关只影响**选哪个 client**, 不进 RequestSpec: 客户端本身决定了
@@ -5515,16 +5535,32 @@ fn js_connect_all(specs: &str, headers: &str, default_headers: &[(String, String
     }
     // 这里的调用方是 `run_blocking_http` 起出来的阻塞线程，本函数内部再起线程
     // 做真并发；`js_connect` 在没有 tokio 上下文的线程上会直接同步发请求。
+    // 出口白名单（方案 §3.1）：thread_local 不跨线程继承，子线程必须显式继承父线程的
+    // 源上下文，否则 check() 见 initialized=false 直接放行 → ajaxAll 成了绕过通道。
+    // 每个子线程结束前取走自己的拦截记录，由父线程归并，保证 take_blocked 收得全。
+    let ctx_snapshot = crate::crawler::egress::snapshot_ctx();
     let results: Vec<JsonValue> = std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
-            .map(|spec| scope.spawn(|| js_connect(spec, headers, default_headers)))
+            .map(|spec| {
+                let snap = ctx_snapshot.clone();
+                scope.spawn(move || {
+                    crate::crawler::egress::adopt_ctx(&snap);
+                    let result = js_connect(spec, headers, default_headers);
+                    let blocked = crate::crawler::egress::drain_blocked();
+                    (result, blocked)
+                })
+            })
             .collect();
         handles
             .into_iter()
             .map(|handle| handle.join().unwrap_or_else(|_| {
-                json!({"body": "", "code": 0, "url": "", "headers": {}, "call_time": 0})
+                (json!({"body": "", "code": 0, "url": "", "headers": {}, "call_time": 0}), Vec::new())
             }))
+            .map(|(result, blocked)| {
+                crate::crawler::egress::merge_blocked(blocked);
+                result
+            })
             .collect()
     });
     JsonValue::Array(results).to_string()

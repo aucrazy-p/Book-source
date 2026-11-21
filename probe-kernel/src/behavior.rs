@@ -98,6 +98,13 @@ pub fn judge(source_host: &str, events: &[BehaviorEvent]) -> (String, Vec<String
             && !target_host.trim_start_matches("www.").eq(&host)
             && !target_host.ends_with(&format!(".{}", host));
 
+        // 出口白名单已实际拦截：能力层判定为外带，直接最高危（方案 §3.1）。
+        // 这条由 egress::check 在唯一出网口触发，是白名单生效的可观测证据。
+        if api == "java.egress_block" {
+            score += 60;
+            reasons.push(format!("L4_EGRESS_BLOCK:{}", target_host));
+            continue;
+        }
         // 数据外带：跨域 POST / 带 body 外发 → 最高危
         if matches!(api, "java.ajax" | "java.post" | "java.get") {
             if is_cross {
@@ -106,18 +113,32 @@ pub fn judge(source_host: &str, events: &[BehaviorEvent]) -> (String, Vec<String
                     score += 60;
                     reasons.push(format!("L4_EXFIL:{}→{}({}B)", api, target_host, ev.body_len.unwrap_or(0)));
                 } else {
-                    score += 10;
-                    reasons.push(format!("L4_CROSS_GET:{}→{}", api, target_host));
+                    // 方案 §2.1 绕过路径兜底：GET 也可能靠 query 带出 cookie/token。
+                    // 观察阶段白名单会记 would_block；此处在 URL 里发现敏感键名时直接拦。
+                    let sensitive = ev.url.as_deref().map(|u| {
+                        let q = u.split_once('?').map(|(_, s)| s).unwrap_or("");
+                        ["cookie", "token", "session", "auth", "secret", "password"]
+                            .iter().any(|k| q.to_ascii_lowercase().contains(&format!("{}=", k)))
+                    }).unwrap_or(false);
+                    if sensitive {
+                        score += 60;
+                        reasons.push(format!("L4_EXFIL_QUERY:{}→{}", api, target_host));
+                    } else {
+                        // 单纯跨域 GET（取图/取 JS）是正常的，只记不扣分——
+                        // 原实现 +10 会让「多次跨域 GET」累积到 suspicious 门槛误杀。
+                        reasons.push(format!("L4_CROSS_GET:{}→{}", api, target_host));
+                    }
                 }
             }
         }
-        // 读凭据
+        // 读凭据：getCookie 保登录是正常功能（方案 §7.4），单独出现只记证据不扣分；
+        // 只有与跨域外发组合才由上面的 L4_EXFIL 规则计入 quarantine。
         if matches!(api, "java.getCookie" | "java.removeCookie" | "java.read_all_cookies") {
-            score += 15;
             reasons.push(format!("L4_CREDENTIAL:{}", api));
         }
-        // 拉浏览器 / WebView / 子进程
-        if matches!(api, "java.startBrowser" | "java.startBrowserAwait" | "java.webView" | "java.__binary") {
+        // 拉浏览器 / WebView（真实能力）。方案 §1：__binary 是纯密码学计算，
+        // 无进程/文件能力，从 LAUNCH 规则移除，避免正常解密源被误判 +40。
+        if matches!(api, "java.startBrowser" | "java.startBrowserAwait" | "java.webView") {
             score += 40;
             reasons.push(format!("L4_LAUNCH:{}", api));
         }
@@ -126,11 +147,9 @@ pub fn judge(source_host: &str, events: &[BehaviorEvent]) -> (String, Vec<String
             score += 20;
             reasons.push(format!("L4_PERSIST:{}", api));
         }
-        // 环境变量 / 仓库文件读取
-        if matches!(api, "java.getenv" | "java.read_file" | "java.env") {
-            score += 80;
-            reasons.push(format!("L4_SENSITIVE_READ:{}", api));
-        }
+        // 方案 §4.2：删除 java.getenv / java.read_file / java.env 的 +80 死规则。
+        // 沙箱未暴露这些原语（全仓 0 处非 behavior 引用），保留只会制造
+        // 「敏感读被拦住了」的虚假安全感。
         // 解码载荷（混淆特征，权重低，需与其他特征叠加）
         if matches!(api, "java.base64Decode" | "java.aesDecodeToString") {
             score += 5;
@@ -179,5 +198,69 @@ mod tests {
         }];
         let (level, _) = judge("mydomain.com", &evs);
         assert_eq!(level, "clean");
+    }
+
+    // ---- 方案 §4.2 规则对齐回归 ----
+
+    #[test]
+    fn cross_get_without_data_is_clean() {
+        // 原实现 +10（虽不到门槛）但仍记分，多次累积会误杀；现在只记证据。
+        let evs: Vec<_> = (0..5).map(|_| BehaviorEvent {
+            ts_ms: 0, api: "java.ajax".into(),
+            url: Some("https://cdn.other.com/cover.jpg".into()),
+            method: Some("GET".into()), body_len: None, evidence: None,
+        }).collect();
+        let (level, reasons) = judge("mydomain.com", &evs);
+        assert_eq!(level, "clean");
+        assert!(reasons.iter().any(|r| r.starts_with("L4_CROSS_GET:")));
+    }
+
+    #[test]
+    fn cross_get_with_cookie_query_quarantines() {
+        // §2.1 绕过路径：GET + query 带 cookie → 必须 quarantine。
+        let evs = vec![BehaviorEvent {
+            ts_ms: 0, api: "java.ajax".into(),
+            url: Some("https://evil.com/c?d=1&cookie=abc".into()),
+            method: Some("GET".into()), body_len: None, evidence: None,
+        }];
+        let (level, reasons) = judge("mydomain.com", &evs);
+        assert_eq!(level, "quarantine");
+        assert!(reasons.iter().any(|r| r.starts_with("L4_EXFIL_QUERY:")));
+    }
+
+    #[test]
+    fn getcookie_alone_is_clean() {
+        // §7.4：getCookie 保登录是正常功能，单条不得判 suspicious。
+        let evs = vec![BehaviorEvent {
+            ts_ms: 0, api: "java.getCookie".into(),
+            url: None, method: None, body_len: None, evidence: None,
+        }];
+        let (level, _) = judge("mydomain.com", &evs);
+        assert_eq!(level, "clean");
+    }
+
+    #[test]
+    fn egress_block_quarantines() {
+        let evs = vec![BehaviorEvent {
+            ts_ms: 0, api: "java.egress_block".into(),
+            url: Some("https://evil.com/collect".into()),
+            method: Some("GET".into()), body_len: None,
+            evidence: Some("fullblock".into()),
+        }];
+        let (level, reasons) = judge("mydomain.com", &evs);
+        assert_eq!(level, "quarantine");
+        assert!(reasons.iter().any(|r| r.starts_with("L4_EGRESS_BLOCK:")));
+    }
+
+    #[test]
+    fn binary_is_not_launch() {
+        // __binary 是纯密码学计算（§1），不得算 +40 拉起原语。
+        let evs = vec![BehaviorEvent {
+            ts_ms: 0, api: "java.__binary".into(),
+            url: None, method: None, body_len: Some(64), evidence: Some("gzip".into()),
+        }];
+        let (level, reasons) = judge("mydomain.com", &evs);
+        assert_eq!(level, "clean");
+        assert!(!reasons.iter().any(|r| r.starts_with("L4_LAUNCH:")));
     }
 }

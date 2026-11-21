@@ -120,7 +120,12 @@ def plan(run_id, size):
             if sid not in pool_ids and sid not in retired:
                 picked.append(r)
             i += 1
-        targets = list(picked)
+        # 出口白名单冷启动（方案 §3.3.1）：新候选首轮标 is_new，强制 observe 一轮。
+        targets = []
+        for t in picked:
+            t = dict(t)
+            t["is_new"] = True
+            targets.append(t)
         # 池统一清理（方案 §19.3）：判定规则变更后（书名精确+作者校验），
         # 存量池源必须尽快用新规则复检，不能靠 10 个/轮慢慢轮转——否则
         # 旧假阳性源（如只能搜到同人的站）会一直占位发布。池未满时源数有限，
@@ -135,19 +140,28 @@ def plan(run_id, size):
                 "source_id": sid, "domain": p.get("domain", ""),
                 "bookSourceName": p.get("bookSourceName", ""),
                 "content_hash": p.get("content_hash", ""),
+                # 源更新（content_hash 与上轮不同）降回 observe 一轮（方案 §3.3.1）。
+                # 池内存 source 的 hash 由 commit 写回；这里比较的目标 hash 若与
+                # 记录一致则为老源（False），不一致说明本轮前刚更新过（True）。
+                "is_new": bool(p.get("pending_observe", False)),
                 "risk_level": "clean", "source": p["source"],
             })
+            # 消费标记：下一轮不再强制 observe（一轮足够）。
+            p["pending_observe"] = False
         st["cursor"] = i  # 推进游标，即使没选够也跳过扫描过的
     else:
         mode = "recheck"
         # 复测池内全部源：用池内存的完整 source 构造目标
-        targets = [
-            {"source_id": p["source_id"], "domain": p.get("domain", ""),
-             "bookSourceName": p.get("bookSourceName", ""),
-             "content_hash": p.get("content_hash", ""),
-             "risk_level": "clean", "source": p["source"]}
-            for p in st["pool"]
-        ]
+        targets = []
+        for p in st["pool"]:
+            targets.append({
+                "source_id": p["source_id"], "domain": p.get("domain", ""),
+                "bookSourceName": p.get("bookSourceName", ""),
+                "content_hash": p.get("content_hash", ""),
+                "is_new": bool(p.get("pending_observe", False)),
+                "risk_level": "clean", "source": p["source"],
+            })
+            p["pending_observe"] = False
 
     save_state(st)
     plan_obj = {"run_id": run_id, "mode": mode, "planned_at": _now(),
@@ -286,8 +300,18 @@ def commit(run_id, fail_limit, blocked_limit):
     is_adult, n_rules = _adult_blocker()
     risk_by_id = {r["source_id"]: r.get("risk_level") for r in rows}
     status_by_id = {r["source_id"]: r.get("status") for r in rows}
+    # 出口白名单拦截记录（方案 §5 误伤发现）：只有**真实拦截**（action=blocked）
+    # 才能触发误伤守卫。observe 阶段所有记录都是 would_block，且陌生域 GET（第 3 档）
+    # 几乎每源都有——若把 would_block 也算，任何 risk 非 clean 的源都会被守卫保留，
+    # risk_filter 退役路径被架空。半拦/全拦阶段才会出现 action=blocked。
+    blocked_by_id = {
+        r["source_id"]: [b for b in (r.get("blocked_hosts") or [])
+                         if isinstance(b, dict) and b.get("action") == "blocked"]
+        for r in rows
+    }
     kept = []
     safety_removed = []
+    guard_blocks = []
     for p in st["pool"]:
         hit, ev = is_adult(p.get("source", {}))
         if hit:
@@ -303,6 +327,24 @@ def commit(run_id, fail_limit, blocked_limit):
             if risk is not None and not timed_out:
                 p["last_checked_round"] = st["round"]
             reason = ("risk_filter:" + str(risk)) if (risk is not None and not timed_out and risk != "clean") else None
+
+            # content_hash 变更检测（方案 §3.3.1）：本轮测到的源若 hash 与池内存
+            # 不同，说明源 JSON 更新（换域名/改规则），下一轮降回 observe 一轮。
+            if risk is not None and not timed_out:
+                # hash 来自 matrix 行的 content_hash（Rust 透传 targets 的值），
+                # 若与池记录不同则标记。注意 targets 的 hash 就是池内存值，
+                # 真正的变更由候选重采触发，这里以「matrix 与池记录不一致」为准。
+                row_hash = next((r.get("content_hash") for r in rows
+                                 if r["source_id"] == p["source_id"]), None)
+                if row_hash and p.get("content_hash") and row_hash != p["content_hash"]:
+                    p["pending_observe"] = True
+                    p["content_hash"] = row_hash
+
+            # 白名单误伤守卫：有 blocked_hosts 且非 clean → 保留源，仅记录告警。
+            if reason and blocked_by_id.get(p["source_id"]):
+                guard_blocks.append((p.get("bookSourceName"), reason,
+                                     len(blocked_by_id[p["source_id"]])))
+                reason = None
         if reason:
             st["retired"][p["source_id"]] = {
                 "reason": reason, "name": p.get("bookSourceName"),
@@ -321,6 +363,11 @@ def commit(run_id, fail_limit, blocked_limit):
         print("[池] 二次安全过滤：移出 %d 个（成人规则命中 %d 个 / risk 过滤 %d 个；"
               "规则库 %d 条），池内剩 %d"
               % (len(safety_removed), n_adult, n_risk, n_rules, len(st["pool"])))
+    if guard_blocks:
+        print("[池] 出口白名单误伤守卫：%d 个源因 blocked_hosts 非空被保留（待人工核对）:"
+              % len(guard_blocks))
+        for name, reason, n in guard_blocks[:10]:
+            print("   - %-20s risk=%s blocked=%d" % (str(name)[:20], reason, n))
 
     save_state(st)
 
