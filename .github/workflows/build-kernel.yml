@@ -128,6 +128,8 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl behavior::tests -- --nocapture
+          # 门禁判定纯函数单测（方案 2026-11-22：头50/热70/腰尾40/招牌2 口径）
+          cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl gate_tests -- --nocapture
           # egress 单测要逐例切 MODE（全局 RwLock），必须串行跑，否则并行互相覆盖
           cargo test --release --manifest-path probe-kernel/Cargo.toml --target x86_64-unknown-linux-musl crawler::egress::tests -- --nocapture --test-threads=1
 

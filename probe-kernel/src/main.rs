@@ -7,12 +7,15 @@
 //!   --concurrency N        并发源数，默认 4
 //!   --timeout-secs N       单请求连接超时，默认 12
 //!   --read-timeout-secs N  单请求读超时，默认 15（阅读器仍用 60s）
-//!   --per-source-secs N    单源墙钟上限（gate + 30 本），默认 75；超时判 TIMEOUT
+//!   --per-source-secs N    单源墙钟上限（gate + 40 本），默认 75；超时判 TIMEOUT
 //!   --global-budget-secs N 整轮墙钟预算，默认 900；超出后剩余源直接判 TIMEOUT
 //!   --min-chapters N       目录可读章节阈值，默认 3
 //!   --min-content-chars N  正文字数阈值，默认 500
-//!   --min-books-pass N     PASSED 门槛：至少 N 本书跑通四步，默认 1
-//!   --min-head-books N     头部门槛：classic+hot 至少 N 本四步全过，默认 1（见 §17.1 B-2）
+//!   --min-books-pass N     PASSED 底线：至少 N 本书跑通四步，默认 1
+//!   --min-head-rate F      头部命中率门槛 hits.classic/classic.len，默认 0=关闭（生产 0.5）
+//!   --min-hot-rate F       热门命中率门槛 hits.hot/hot.len，默认 0=关闭（第一轮采集用 0，第二轮 0.7）
+//!   --min-waist-rate F     腰尾命中率门槛 (waist+longtail)/(waist+longtail).len，默认 0=关闭（生产 0.4）
+//!   --min-flagship N       招牌命中本数门槛，默认 0=关闭（生产 2）
 //!   --host-whitelist h1,h2 允许跨域的目标主机
 //!   --host-policy <path>  出口白名单策略文件（平台域/托管域/手工放行）；不传则仅用声明域
 //!
@@ -84,6 +87,60 @@ struct ProbeBooks {
     waist: Vec<ProbeBook>,
     #[serde(default)]
     longtail: Vec<ProbeBook>,
+    /// 招牌层：5 本国民级书，命中 ≥ min_flagship 才 PASSED。
+    /// 必须 `#[serde(default)]`：旧书单（无此字段）解析不能 panic。
+    #[serde(default)]
+    flagship: Vec<ProbeBook>,
+}
+
+/// 门禁判定结果（纯数据，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GateOutcome {
+    /// 头部命中率是否达标（只算 classic，不含 hot）。
+    head_ok: bool,
+    /// 热门命中率是否达标（min_hot_rate<=0 时恒真=关闭）。
+    hot_ok: bool,
+    /// 腰尾命中率是否达标。
+    waist_ok: bool,
+    /// 招牌命中数是否达标。
+    flag_ok: bool,
+}
+
+/// 达标所需最小命中本数 = ceil(rate * len)。rate<=0 由各 *_ok 的关闭分支处理，
+/// 本函数只负责非零比例；用 f64 转 ceil，书单长度都是整十，无浮点误差。
+fn min_count(rate: f64, len: usize) -> u32 {
+    if rate <= 0.0 || len == 0 {
+        return 0;
+    }
+    (rate * len as f64).ceil() as u32
+}
+
+/// 门禁判定纯函数（方案 §4 伪代码落地）。
+/// 口径写死：分母用书单实际长度；`min_*rate<=0` 表示该门关闭；head_ok 只算 classic。
+#[allow(clippy::too_many_arguments)]
+fn evaluate_gate(
+    classic_hits: u32,
+    classic_len: usize,
+    hot_hits: u32,
+    hot_len: usize,
+    waist_hits: u32,
+    longtail_hits: u32,
+    waist_longtail_len: usize,
+    flagship_hit: u32,
+    min_head_rate: f64,
+    min_hot_rate: f64,
+    min_waist_rate: f64,
+    min_flagship: u32,
+) -> GateOutcome {
+    let head_ok = min_head_rate <= 0.0
+        || (classic_len > 0 && classic_hits >= min_count(min_head_rate, classic_len));
+    let hot_ok = min_hot_rate <= 0.0
+        || (hot_len > 0 && hot_hits >= min_count(min_hot_rate, hot_len));
+    let waist_ok = min_waist_rate <= 0.0
+        || (waist_longtail_len > 0
+            && (waist_hits + longtail_hits) >= min_count(min_waist_rate, waist_longtail_len));
+    let flag_ok = min_flagship == 0 || flagship_hit >= min_flagship;
+    GateOutcome { head_ok, hot_ok, waist_ok, flag_ok }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -151,8 +208,10 @@ struct ProbeResult {
     hit_hot: f64,
     hit_waist: f64,
     hit_longtail: f64,
-    /// 方案 §17.1 B-2 门禁：头部命中率是否达标（供诊断 PARTIAL 原因）。
+    /// 头部命中率是否达标（gate.head_ok，供诊断 PARTIAL 原因；旧字段名保持兼容）。
     head_gate_ok: bool,
+    /// 招牌层命中本数（方案 §4）。下游可据此诊断招牌未过的源。
+    flagship_hit: u32,
     hits: HashMap<String, u32>,
     attempts: HashMap<String, u32>,
     hit_titles: Vec<String>,
@@ -174,7 +233,7 @@ struct Config {
     /// 单请求读超时。探测路径用短值（默认 15s），否则几十个源 × 上百个请求
     /// 按 60s 累加就能吃穿整轮墙钟。阅读器不受影响（仍 60s）。
     read_timeout_secs: u64,
-    /// 单源墙钟上限：gate + 30 本探针书。超时判 `TIMEOUT`，保留已采部分结果。
+    /// 单源墙钟上限：gate + 40 本探针书。超时判 `TIMEOUT`，保留已采部分结果。
     /// 依据历史均速（402s / 60 源 ≈ 27s/源）留 ~3 倍余量。
     per_source_secs: u64,
     /// 整轮墙钟预算：超预算的源不再探测，直接产 `TIMEOUT` 行占位。
@@ -182,14 +241,16 @@ struct Config {
     global_budget_secs: u64,
     min_chapters: usize,
     min_content_chars: usize,
-    /// PASSED 门槛：至少 N 本探针书完整跑通四步。默认 1（证明链路真实可用即合格；
-    /// 覆盖度由 hit_* 单独统计，不混进 PASSED 判定）。想更严可上调。
+    /// PASSED 门槛：至少 N 本探针书完整跑通四步。默认 1（证明链路真实可用即合格）。
     min_books_pass: u32,
-    /// 方案 §17.1 B-2：头部（classic+hot）四步全过的最少本数，用于排除坏源。
-    /// 默认 1 —— 头部 20 本至少 1 本真跑通即可；非小说站/凑结构的站头部命中 0，
-    /// 会被这道门禁挡住。实测用「命中率≥0.3」会误杀真源（机房 IP 下真源头部仅 2~4/20），
-    /// 故按方案原意「头部排除坏源」改为本数门槛。设为 0 关闭。
-    min_head_books: u32,
+    /// 头部命中率门槛：hits.classic / classic.len >= 此值。默认 0.0=关闭。
+    min_head_rate: f64,
+    /// 热门命中率门槛：hits.hot / hot.len >= 此值。默认 0.0=关闭（第一轮只采集）。
+    min_hot_rate: f64,
+    /// 腰尾命中率门槛：(hits.waist+hits.longtail)/(waist+longtail).len >= 此值。默认 0.0=关闭。
+    min_waist_rate: f64,
+    /// 招牌命中本数门槛：flagship_hit >= 此值。默认 0=关闭。
+    min_flagship: u32,
     host_whitelist: Vec<String>,
     /// 出口白名单策略文件路径（可选）。
     host_policy: Option<String>,
@@ -206,7 +267,10 @@ impl Default for Config {
             min_chapters: 3,
             min_content_chars: 500,
             min_books_pass: 1,
-            min_head_books: 1,
+            min_head_rate: 0.0,
+            min_hot_rate: 0.0,
+            min_waist_rate: 0.0,
+            min_flagship: 0,
             host_whitelist: Vec::new(),
             host_policy: None,
         }
@@ -604,6 +668,7 @@ fn timeout_result(rec: &SourceRec, fail_stage: &str) -> ProbeResult {
         hit_waist: 0.0,
         hit_longtail: 0.0,
         head_gate_ok: false,
+        flagship_hit: 0,
         hits: HashMap::new(),
         attempts: HashMap::new(),
         hit_titles: Vec::new(),
@@ -713,17 +778,38 @@ fn probe_source(
     let hit_hot = tier_rate("hot", books.hot.len());
     let hit_waist = tier_rate("waist", books.waist.len());
     let hit_longtail = tier_rate("longtail", books.longtail.len());
+
+    let classic_hits = hits.get("classic").copied().unwrap_or(0);
+    let hot_hits = hits.get("hot").copied().unwrap_or(0);
+    let waist_hits = hits.get("waist").copied().unwrap_or(0);
+    let longtail_hits = hits.get("longtail").copied().unwrap_or(0);
+    // 招牌命中 = 四层命中集合里有几本落在 flagship 列表内。
+    // 注意：hit_titles 存的是探针书名 b.title（其命中已由上游 name_match 判定，
+    // 上游放行的"精校版"等后缀在此不会再被区分）；norm_title 这里只做归一化比对，
+    // 语义是「命中子集计数」，不是给招牌加独立精度层。
+    let flagship_hit = books
+        .flagship
+        .iter()
+        .filter(|fb| {
+            let f = norm_title(fb.title.trim());
+            !f.is_empty() && hit_titles.iter().any(|t| norm_title(t.trim()) == f)
+        })
+        .count() as u32;
+
     let chain_ok = n_hit >= cfg.min_books_pass;
-    // 方案 §17.1 B-2：头部层（classic+hot）用于排除坏源。
-    // 头部门禁 = 头部四步全过的本数 >= min_head_books（默认 1）。
-    // 非小说站头部命中 0 → 拦；真源头部普遍 2~4 本 → 过。
-    // 长尾命中率仍是「书全」主指标，交给 04_select 算边际，不参与 PASSED 门禁。
-    let head_pass = hits.get("classic").copied().unwrap_or(0)
-        + hits.get("hot").copied().unwrap_or(0);
-    let head_gate_ok = head_pass >= cfg.min_head_books;
+    // 门禁判定（方案 §4）：头部只算 classic；热门/腰尾/招牌各自独立；比例分母用书单实际长度。
+    // 命名为 verdict，避免遮蔽上面 let gate = fetch_step(...)（后面 search_detail 还要用 gate.err）。
+    let verdict = evaluate_gate(
+        classic_hits, books.classic.len(),
+        hot_hits, books.hot.len(),
+        waist_hits, longtail_hits, books.waist.len() + books.longtail.len(),
+        flagship_hit,
+        cfg.min_head_rate, cfg.min_hot_rate, cfg.min_waist_rate, cfg.min_flagship,
+    );
+    let gate_all_ok = verdict.head_ok && verdict.hot_ok && verdict.waist_ok && verdict.flag_ok;
     let mut status = if !gate_ok {
         gate_status.to_string()
-    } else if chain_ok && head_gate_ok {
+    } else if chain_ok && gate_all_ok {
         "PASSED".into()
     } else {
         "PARTIAL".into()
@@ -752,12 +838,20 @@ fn probe_source(
     if level == "clean" && status == "PARTIAL" { level = "suspicious".into(); }
 
     // fail_stage 决定下游日志的可读性；TIMEOUT 要能区分是单源超时还是整轮预算。
+    // 门禁未过时按 HEAD→HOT→WAIST→FLAG 顺序报第一个未过项，便于定位。
     let fail_stage = if status == "TIMEOUT" {
         format!("TIMEOUT:per_source:probed={}", probe_count)
     } else if !gate_ok {
         format!("SEARCH:{}", gate_status)
-    } else if !head_gate_ok {
-        format!("HEAD_GATE:head_pass={}<{}", head_pass, cfg.min_head_books)
+    } else if !verdict.head_ok {
+        format!("HEAD_GATE:{}/{}<{}", classic_hits, books.classic.len(), cfg.min_head_rate)
+    } else if !verdict.hot_ok {
+        format!("HOT_GATE:{}/{}<{}", hot_hits, books.hot.len(), cfg.min_hot_rate)
+    } else if !verdict.waist_ok {
+        format!("WAIST_GATE:{}/{}<{}", waist_hits + longtail_hits,
+            books.waist.len() + books.longtail.len(), cfg.min_waist_rate)
+    } else if !verdict.flag_ok {
+        format!("FLAGSHIP_GATE:{}<{}", flagship_hit, cfg.min_flagship)
     } else if !chain_ok {
         format!("CHAIN:n_hit={}<{}", n_hit, cfg.min_books_pass)
     } else {
@@ -783,7 +877,8 @@ fn probe_source(
         hit_hot,
         hit_waist,
         hit_longtail,
-        head_gate_ok,
+        head_gate_ok: verdict.head_ok,
+        flagship_hit,
         hits,
         attempts,
         hit_titles,
@@ -802,7 +897,7 @@ fn probe_source(
 fn parse_args() -> (String, String, String, Config) {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--read-timeout-secs N] [--per-source-secs N] [--global-budget-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-books N] [--host-whitelist h1,h2] [--host-policy <path>]");
+        eprintln!("用法: probe-kernel <sources.json> <probe_books.json> <out.jsonl> [--concurrency N] [--timeout-secs N] [--read-timeout-secs N] [--per-source-secs N] [--global-budget-secs N] [--min-chapters N] [--min-content-chars N] [--min-books-pass N] [--min-head-rate F] [--min-hot-rate F] [--min-waist-rate F] [--min-flagship N] [--host-whitelist h1,h2] [--host-policy <path>]");
         std::process::exit(2);
     }
     let mut cfg = Config::default();
@@ -819,7 +914,15 @@ fn parse_args() -> (String, String, String, Config) {
             "--min-chapters" => cfg.min_chapters = val.parse().unwrap_or(3),
             "--min-content-chars" => cfg.min_content_chars = val.parse().unwrap_or(500),
             "--min-books-pass" => cfg.min_books_pass = val.parse().unwrap_or(1),
-            "--min-head-books" => cfg.min_head_books = val.parse().unwrap_or(1),
+            "--min-head-rate" => cfg.min_head_rate = val.parse().unwrap_or(0.0),
+            "--min-hot-rate" => cfg.min_hot_rate = val.parse().unwrap_or(0.0),
+            "--min-waist-rate" => cfg.min_waist_rate = val.parse().unwrap_or(0.0),
+            "--min-flagship" => cfg.min_flagship = val.parse().unwrap_or(0),
+            // 兼容旧参数：--min-head-books 已废弃（本数口径），保留解析不报错、不再参与判定。
+            "--min-head-books" => {
+                let _ = val.parse::<u32>();
+                eprintln!("[probe-kernel] 警告：--min-head-books 已废弃，请改用 --min-head-rate（比例口径）");
+            }
             "--host-whitelist" => cfg.host_whitelist = val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
             "--host-policy" => cfg.host_policy = Some(val.to_string()),
             _ => {}
@@ -856,9 +959,12 @@ fn main() {
     };
     let books_raw = fs::read_to_string(&books_path).expect("读取 probe_books.json 失败");
     let books: ProbeBooks = serde_json::from_str(&books_raw).expect("解析探针书单失败");
-    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{} 并发={} 阈值章节>={}正文>={} 门禁头部>={}本 总命中>={}本",
+    eprintln!("[probe-kernel] 候选={} 探针=经典{}热门{}腰部{}长尾{}招牌{} 并发={} 阈值章节>={}正文>={} 总命中>={}本",
         recs.len(), books.classic.len(), books.hot.len(), books.waist.len(), books.longtail.len(),
-        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_head_books, cfg.min_books_pass);
+        books.flagship.len(),
+        cfg.concurrency, cfg.min_chapters, cfg.min_content_chars, cfg.min_books_pass);
+    eprintln!("[probe-kernel] 门禁：头部率>={} 热门率>={} 腰尾率>={} 招牌>={}本",
+        cfg.min_head_rate, cfg.min_hot_rate, cfg.min_waist_rate, cfg.min_flagship);
     eprintln!("[probe-kernel] 超时策略：连接 {}s / 读 {}s / 单源 {}s / 整轮预算 {}s",
         cfg.timeout_secs, cfg.read_timeout_secs, cfg.per_source_secs, cfg.global_budget_secs);
 
@@ -923,4 +1029,105 @@ fn main() {
         n_timeout.load(std::sync::atomic::Ordering::Relaxed),
         start.elapsed().as_secs()
     );
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::{evaluate_gate, min_count, GateOutcome};
+
+    /// 第二轮实际生效的阈值：头 0.5 / 热 0.7 / 腰尾 0.4 / 招牌 2。
+    const HEAD: f64 = 0.5;
+    const HOT: f64 = 0.7;
+    const WAIST: f64 = 0.4;
+    const FLAG: u32 = 2;
+
+    fn gate(c: u32, h: u32, w: u32, l: u32, f: u32) -> GateOutcome {
+        evaluate_gate(c, 10, h, 10, w, l, 20, f, HEAD, HOT, WAIST, FLAG)
+    }
+
+    // ---- min_count ----
+
+    #[test]
+    fn min_count_ceil_rounds_up() {
+        assert_eq!(min_count(0.5, 10), 5);
+        assert_eq!(min_count(0.7, 10), 7);
+        assert_eq!(min_count(0.4, 20), 8);
+        // 0.45*10=4.5 → ceil 5，不能取 4
+        assert_eq!(min_count(0.45, 10), 5);
+    }
+
+    #[test]
+    fn min_count_zero_rate_or_len_is_zero() {
+        assert_eq!(min_count(0.0, 10), 0);
+        assert_eq!(min_count(-0.1, 10), 0);
+        assert_eq!(min_count(0.5, 0), 0);
+    }
+
+    // ---- 头部（只算 classic）----
+
+    #[test]
+    fn head_exactly_five_of_ten_passes() {
+        let g = gate(5, 0, 0, 0, 0);
+        assert!(g.head_ok, "5/10 = 0.5 达标");
+    }
+
+    #[test]
+    fn head_four_of_ten_fails() {
+        let g = gate(4, 0, 0, 0, 0);
+        assert!(!g.head_ok, "4/10 = 0.4 < 0.5 应挡");
+    }
+
+    #[test]
+    fn head_ignores_hot_hits() {
+        // classic 只有 1 本，hot 打满 10 —— 头部依然不达标，证明 hot 不掺进头部
+        let g = gate(1, 10, 0, 0, 0);
+        assert!(!g.head_ok, "头部口径只算 classic，hot 打满也不能救");
+    }
+
+    // ---- 热门（第一轮 min_hot_rate=0 关闭；第二轮 0.7）----
+
+    #[test]
+    fn hot_zero_rate_disables_gate() {
+        let g = evaluate_gate(0, 10, 0, 10, 0, 0, 20, 0, HEAD, 0.0, WAIST, FLAG);
+        assert!(g.hot_ok, "min_hot_rate=0 时热门门禁恒真（第一轮只采集）");
+    }
+
+    #[test]
+    fn hot_seven_of_ten_passes_six_fails() {
+        assert!(gate(10, 7, 10, 10, 2).hot_ok, "7/10 = 0.7 达标");
+        assert!(!gate(10, 6, 10, 10, 2).hot_ok, "6/10 = 0.6 < 0.7 应挡");
+    }
+
+    // ---- 腰尾（waist+longtail 合计 / 20）----
+
+    #[test]
+    fn waist_longtail_summed_against_twenty() {
+        // waist 4 + longtail 4 = 8/20 = 0.4 达标（单看任一层都不够）
+        assert!(gate(10, 10, 4, 4, 2).waist_ok);
+        // 7/20 = 0.35 < 0.4 应挡
+        assert!(!gate(10, 10, 4, 3, 2).waist_ok);
+    }
+
+    // ---- 招牌 ----
+
+    #[test]
+    fn flagship_two_passes_one_fails() {
+        assert!(gate(10, 10, 10, 10, 2).flag_ok);
+        assert!(!gate(10, 10, 10, 10, 1).flag_ok);
+    }
+
+    #[test]
+    fn flagship_zero_required_disables_gate() {
+        let g = evaluate_gate(0, 10, 0, 10, 0, 0, 20, 0, 0.0, 0.0, 0.0, 0);
+        assert!(g.flag_ok && g.head_ok && g.hot_ok && g.waist_ok, "全 0 阈值 = 全关");
+    }
+
+    // ---- 组合：全过才算 PASSED 的语义 ----
+
+    #[test]
+    fn all_conditions_must_hold() {
+        // 头部够、热门够、招牌够，但腰尾 7/20 不够 → 整体不过
+        let g = gate(5, 7, 4, 3, 2);
+        assert!(g.head_ok && g.hot_ok && g.flag_ok && !g.waist_ok);
+    }
 }
