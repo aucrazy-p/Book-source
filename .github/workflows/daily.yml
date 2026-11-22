@@ -124,7 +124,7 @@ jobs:
             --read-timeout-secs 15 --per-source-secs 100 --global-budget-secs 1200 \
             --min-chapters 3 --min-content-chars 500 \
             --min-books-pass 1 --min-head-rate 0.5 --min-waist-rate 0.4 --min-flagship 2 \
-            --min-hot-rate 0 \
+            --min-hot-rate 0.7 \
             --host-policy /work/runs/ci/host_policy.json
           docker rm -f probe-sandbox-run 2>/dev/null || true
           python3 - <<'PY'
