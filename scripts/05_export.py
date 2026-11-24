@@ -21,7 +21,8 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-from lib import dump_json, load_json, load_jsonl, run_dir
+from lib import (apply_measured_respond_time, dump_json, load_json, load_jsonl,
+                 run_dir)
 
 
 def clean_source(src):
@@ -34,8 +35,17 @@ def export(run_id, all_passed=False, out_path=None):
     cands = load_jsonl(os.path.join(d, "candidates.jsonl"))
     by_id = {c["source_id"]: c for c in cands}
 
+    # 实测响应时间：matrix 里有本轮探测测到的 respond_time_ms，写回 respondTime，
+    # 否则页面显示的是上游导出时自带的老数字（甚至「待复测」）。
+    # TIMEOUT / BLOCKED 行不采纳：这两类行的 respond_time_ms 是"已跑完那几次的
+    # 平均耗时"，不是正常响应，写回去会让超时/被拦的源显示成"很快"。
+    matrix = []
+    mpath = os.path.join(d, "matrix.jsonl")
+    if os.path.exists(mpath):
+        matrix = load_jsonl(mpath)
+    measured = {r.get("source_id"): r for r in matrix if r.get("source_id")}
+
     if all_passed:
-        matrix = load_jsonl(os.path.join(d, "matrix.jsonl"))
         ids = [r["source_id"] for r in matrix
                if r.get("search_ok") is True and r.get("status") == "PASSED"
                and r.get("risk_level") == "clean"]
@@ -51,7 +61,11 @@ def export(run_id, all_passed=False, out_path=None):
         if not c:
             missing.append(sid)
             continue
-        sources.append(clean_source(c["source"]))
+        src = clean_source(c["source"])
+        r = measured.get(sid)
+        if r and r.get("status") not in ("TIMEOUT", "BLOCKED"):
+            apply_measured_respond_time(src, r.get("respond_time_ms"))
+        sources.append(src)
 
     if out_path:
         path = os.path.abspath(out_path)

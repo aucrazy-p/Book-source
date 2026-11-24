@@ -210,3 +210,24 @@ def dump_jsonl(path, rows):
 def load_jsonl(path):
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def apply_measured_respond_time(source, respond_ms):
+    """把探测实测响应时间写回书源 respondTime（毫秒，legado 原生字段）。
+
+    历史问题：导出链路（05_export / 06_pool）此前全量透传上游原始 respondTime，
+    探测实测的 respond_time_ms 从没写回，页面上的秒数与「待复测」都是陈旧/失实数据。
+
+    只在实测值有效（能转成正整数）时覆盖：
+    - None / 0 / 负数 / 非数字 → 保持原值不动。0 表示"没测到"，若写成 0，
+      页面会显示成 0s 最快，比「待复测」更误导。
+    返回是否写入。
+    """
+    try:
+        ms = int(respond_ms)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if ms <= 0:
+        return False
+    source["respondTime"] = ms
+    return True

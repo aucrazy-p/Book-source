@@ -33,8 +33,8 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-from lib import (dump_json, dump_jsonl, load_json, load_jsonl,
-                 run_dir, runs_root, source_id)
+from lib import (apply_measured_respond_time, dump_json, dump_jsonl, load_json,
+                 load_jsonl, run_dir, runs_root, source_id)
 
 POOL_SIZE = 50
 FAIL_LIMIT = 2      # 连续 FAILED 达此值移出（真失效）
@@ -305,6 +305,35 @@ def _recheck(st, rows, fail_limit, blocked_limit):
     return removed
 
 
+def _refresh_respond_times(st, rows):
+    """用本轮实测 respond_time_ms 刷新池内所有源的 source.respondTime。
+
+    必须在 fill/recheck 两个分支之后统一跑：fill 模式不进 _recheck，
+    但池内源本轮同样被探测过（targets 里带复测），不刷新就会一直留着
+    上游导出的老数字，页面显示陈旧甚至「待复测」。
+
+    只采纳 status 为正常探测（非 TIMEOUT / 非 BLOCKED）的行：
+    - TIMEOUT 行的 respond_time_ms 不是 0，而是"已跑完那几次探测的平均耗时"
+      （kernel 用 total_ms/probe_count 算），写回去会让一个撞满单源 deadline
+      的源在页面上显示成"4.4s 一般"，纯属误导；
+    - BLOCKED 行同理（被出口白名单拦下的源也有耗时值）。
+    实测值无效（0 / None）时保留原值，不清零。
+    返回刷新条数。
+    """
+    by_id = {r.get("source_id"): r for r in rows if r.get("source_id")}
+    n = 0
+    for p in st["pool"]:
+        src = p.get("source")
+        if not isinstance(src, dict):
+            continue
+        r = by_id.get(p.get("source_id"))
+        if not r or r.get("status") in ("TIMEOUT", "BLOCKED"):
+            continue
+        if apply_measured_respond_time(src, r.get("respond_time_ms")):
+            n += 1
+    return n
+
+
 def commit(run_id, fail_limit, blocked_limit):
     d = run_dir(run_id)
     st = load_state()
@@ -325,6 +354,11 @@ def commit(run_id, fail_limit, blocked_limit):
         for name, reason in gone:
             print("[池]   淘汰 %-20s (%s)" % (str(name)[:20], reason))
         print("[池] recheck：淘汰 %d 个，池内剩 %d" % (removed, len(st["pool"])))
+
+    # 响应时间写回：fill / recheck 都要做，否则页面数字永远是上游老值
+    n_rt = _refresh_respond_times(st, rows)
+    print("[池] 响应时间写回 %d/%d 个（TIMEOUT/BLOCKED 不覆盖，保留原值）"
+          % (n_rt, len(st["pool"])))
 
     # 导出前二次安全过滤：源头 02_normalize 已筛过新候选，但池内可能残留
     # 旧规则漏网的源（成人新变体域名），或历史版本放过的高低风险源。
