@@ -1574,5 +1574,180 @@
   "_upstream": "yckceo:baseline",
   "_upstream_name": "校验400+",
   "_is_valid": true
+ },
+ {
+  "bookSourceComment": "",
+  "bookSourceGroup": "小说",
+  "bookSourceName": "快眼看书",
+  "bookSourceType": 0,
+  "bookSourceUrl": "http://www.xbotaodz.info",
+  "customButton": false,
+  "customOrder": 67,
+  "enabled": true,
+  "enabledCookieJar": false,
+  "enabledExplore": false,
+  "eventListener": false,
+  "lastUpdateTime": 1787214019794,
+  "respondTime": 19077,
+  "ruleBookInfo": {
+   "author": "class.novelinfo-l@tag.li.0@text##作者：",
+   "coverUrl": "class.novelinfo-r@tag.a@tag.img@src",
+   "intro": "class.novelintro@text##各位书友要是.*",
+   "kind": "[property=\"og:novel:category\"]@content&&[property=\"og:novel:status\"]@content",
+   "lastChapter": "class.novelinfo-l@li@a@text",
+   "name": "class.w-left@tag.h1@text"
+  },
+  "ruleContent": {
+   "content": "id.chaptercontent@textNodes"
+  },
+  "ruleExplore": {},
+  "ruleSearch": {
+   "author": "class.info@tag.span.1@text",
+   "bookList": "class.librarylist@tag.li",
+   "bookUrl": "class.info@tag.span.0@tag.a@href",
+   "coverUrl": "class.pt-ll-l@tag.a@tag.img@src",
+   "lastChapter": "class.last@tag.a@text",
+   "name": "class.info@tag.span.0@tag.a@text"
+  },
+  "ruleToc": {
+   "chapterList": "class.fulldir@tag.ul@tag.li@tag.a",
+   "chapterName": "text",
+   "chapterUrl": "href"
+  },
+  "searchUrl": "http://www.xbotaodz.info/modules/article/search.php?searchkey={{key}}",
+  "weight": 0,
+  "_upstream": "yckceo:baseline",
+  "_upstream_name": "超级精选·重排去重",
+  "_is_valid": true
+ },
+ {
+  "bookSourceComment": "有黄广告",
+  "bookSourceGroup": "小说",
+  "bookSourceName": "梦想文学",
+  "bookSourceType": 0,
+  "bookSourceUrl": "http://www.mxjtedu.com/",
+  "customButton": false,
+  "customOrder": 56,
+  "enabled": true,
+  "enabledCookieJar": false,
+  "enabledExplore": false,
+  "eventListener": false,
+  "lastUpdateTime": 1780209725883,
+  "respondTime": 25404,
+  "ruleBookInfo": {
+   "author": "class.fix@p.0@text##作者：",
+   "coverUrl": "img@src",
+   "intro": "class.m-desc xs-show@text##简介: ",
+   "kind": "class.fix@p.1@text##类别：",
+   "lastChapter": "class.fix@p.5@text##最新章节：",
+   "name": "class.layout-tit.1@text##最新章节"
+  },
+  "ruleContent": {
+   "content": ".content@textNodes",
+   "nextContentUrl": "class.m-bottom-opt@a.3@href",
+   "replaceRegex": "##（本章未完，请点击下一页继续阅读）\\s",
+   "title": "h1@title@text"
+  },
+  "ruleExplore": {},
+  "ruleSearch": {
+   "author": "class.s4@text",
+   "bookList": "class.txt-list-row5@li:not(:first-child)",
+   "bookUrl": "class.s2@a@href",
+   "kind": "class.s1@text",
+   "lastChapter": "class.s3@text",
+   "name": "class.s2@text"
+  },
+  "ruleToc": {
+   "chapterList": "class.section-box.1@li",
+   "chapterName": "a@text",
+   "chapterUrl": "a@href",
+   "nextTocUrl": "class.listpage@a.-1@href"
+  },
+  "searchUrl": "search.php?keyWord={{key}}",
+  "weight": 0,
+  "_upstream": "yckceo:baseline",
+  "_upstream_name": "超级精选·重排去重",
+  "_is_valid": true
+ },
+ {
+  "bookSourceComment": "",
+  "bookSourceGroup": "2026年11月07日搜索校验",
+  "bookSourceName": "🎃酷书阁小说网🎃",
+  "bookSourceType": 0,
+  "bookSourceUrl": "https://www.kushuge.com#🎃",
+  "bookUrlPattern": "",
+  "concurrentRate": "",
+  "coverDecodeJs": "",
+  "customButton": false,
+  "customOrder": 478,
+  "enabled": true,
+  "enabledCookieJar": false,
+  "enabledExplore": true,
+  "eventListener": false,
+  "exploreScreen": "",
+  "exploreUrl": "[\n  {\n    \"title\": \"玄幻\",\n    \"url\": \"/list1/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"武侠\",\n    \"url\": \"/list2/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"都市\",\n    \"url\": \"/list3/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"历史\",\n    \"url\": \"/list4/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"网游\",\n    \"url\": \"/list5/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"科幻\",\n    \"url\": \"/list6/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"言情\",\n    \"url\": \"/list7/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  },\n  {\n    \"title\": \"其他\",\n    \"url\": \"/list8/{{page}}.html\",\n    \"style\": {\n      \"layout_flexGrow\": 1,\n      \"layout_flexBasisPercent\": 0.4\n    }\n  }\n]",
+  "header": "{\"User-Agent\":\"Mozilla/5.0 (Linux; U; Android 13; zh-Hans-CN; PFJM10 Build/TP1A.220905.001) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/135.0.4896.58 Quark/6.13.6.581 Mobile Safari/537.36\",\"Accept-Language\":\"zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7\"}",
+  "lastUpdateTime": 0,
+  "loginCheckJs": "",
+  "loginUi": "",
+  "loginUrl": "",
+  "respondTime": 111594,
+  "ruleBookInfo": {
+   "author": "[property=\"og:novel:author\"]@content",
+   "canReName": "",
+   "coverUrl": "[property=\"og:image\"]@content",
+   "init": "",
+   "intro": "[property=\"og:description\"]@content",
+   "kind": "[property~=category|status|update_time]@content",
+   "lastChapter": "[property~=las?test_chapter_name]@content",
+   "name": "[property=\"og:novel:book_name\"]@content",
+   "tocUrl": "",
+   "wordCount": ""
+  },
+  "ruleContent": {
+   "content": "article@html##第\\(\\d+\\/\\d+\\)页",
+   "imageStyle": "",
+   "nextContentUrl": "text.下一@href\n@js:\nvar next=/_\\d+\\.html/.test(result) ? result : '';\nnext;",
+   "replaceRegex": "",
+   "sourceRegex": "",
+   "webJs": ""
+  },
+  "ruleExplore": {
+   "author": "",
+   "bookList": "",
+   "bookUrl": "",
+   "coverUrl": "",
+   "intro": "",
+   "kind": "",
+   "lastChapter": "",
+   "name": "",
+   "wordCount": ""
+  },
+  "ruleSearch": {
+   "author": "span.0@text",
+   "bookList": ".col-md-6@dl",
+   "bookUrl": "a.0@href",
+   "coverUrl": "img@src",
+   "intro": "",
+   "kind": "{{@a.1@text##\\[(.*)\\].*##$1}}\n{{@dd.2:3##状态：?:?|更新时间：?:?}}",
+   "lastChapter": "a.2@text",
+   "name": "a.1@text##\\[.*\\](.*)##$1",
+   "wordCount": ""
+  },
+  "ruleToc": {
+   "chapterList": ".book_list2@ul@li@a",
+   "chapterName": "text",
+   "chapterUrl": "href",
+   "isVip": "",
+   "isVolume": "",
+   "nextTocUrl": ".page-link.0@text##\\d+\\/(\\d+)##$1\n@js:\nres = JSON.parse(result)\nlist = [];\nfor (var i = 2; i <= res; i++) {\n\tlist.push(baseUrl.replace(/\\/$/,\"/index_\" + i + \".html\")); \n}\nlist;",
+   "updateTime": ""
+  },
+  "searchUrl": "/search.php?q={{key}}&p={{page}}",
+  "variableComment": "",
+  "weight": 1,
+  "_upstream": "yckceo:baseline",
+  "_upstream_name": "校验400+",
+  "_is_valid": true
  }
 ]
