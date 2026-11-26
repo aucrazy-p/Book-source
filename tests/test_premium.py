@@ -41,6 +41,42 @@ def src(name, url, search=None, js=None, lut=None):
     return s
 
 
+class TestPremiumRules(unittest.TestCase):
+    """规则配置：域名级名单可解析 + 擦边词不加单字 + 误伤守卫。"""
+
+    def test_adult_domains_file_exists_and_parseable(self):
+        path = os.path.join(ROOT, "conf", "adult_domains.txt")
+        self.assertTrue(os.path.exists(path), "域名级成人名单文件应存在")
+        domains = cyv.load_adult_domains()
+        self.assertIsInstance(domains, list)
+        for d in domains:
+            self.assertIsInstance(d, str)
+            self.assertTrue(d.strip())
+            self.assertFalse(d.startswith("#"))
+
+    def test_no_single_char_adult_words(self):
+        path = os.path.join(ROOT, "conf", "adult_filter.txt")
+        singles = []
+        for line in open(path, encoding="utf-8"):
+            w = line.strip()
+            if w and not w.startswith("#") and len(w) == 1:
+                singles.append(w)
+        self.assertEqual(singles, [], "擦边词不得用单字（历史误伤 java/xxx）")
+
+    def test_java_api_not_flagged(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_norm02_rules", os.path.join(ROOT, "scripts", "02_normalize.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pats = mod.load_adult_patterns()
+        # is_adult 只拼接 name+url——把误伤诱饵放真正读取的字段才有守卫意义
+        s1 = src("java.ajax 书源规则", "https://a.com")
+        s2 = src("甲", "https://www.xxxbiquge.net")
+        self.assertFalse(mod.is_adult(s1, pats)[0], "java.ajax 在名称中不得被判成人")
+        self.assertFalse(mod.is_adult(s2, pats)[0], "xxxbiquge 在域名中不得被判成人")
+
+
 class TestPremiumFilter(unittest.TestCase):
     def test_premium_filters_js_and_no_search(self):
         std = src("甲", "https://a.com")
@@ -69,6 +105,15 @@ class TestPremiumFilter(unittest.TestCase):
         self.assertEqual(out[0]["bookSourceName"], "甲")
         self.assertEqual(meta["dropped_adult"], 1)
 
+    def test_premium_filters_adult_domain(self):
+        ok = src("甲", "https://a.com")
+        bad = src("擦边站", "https://evil-adult.example.com")
+        with mock.patch.object(cyv, "load_adult_domains", return_value=["evil-adult.example.com"]):
+            out, meta = cyv.premium_filter([ok, bad], log=lambda *_: None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["bookSourceName"], "甲")
+        self.assertEqual(meta["dropped_adult_domain"], 1)
+
     def test_premium_dedupe_by_domain(self):
         # 同站换皮：URL 尾部尾标不同，normalize_url 归一到同一 source_id
         a = src("甲-原版", "https://a.com", lut=100)
@@ -77,10 +122,93 @@ class TestPremiumFilter(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(meta["dropped_dup"], 1)
 
+    def test_crosshost_duplicate_dropped_keeps_newest(self):
+        # 不同域名、相同规则体（searchUrl 相同）→ content_hash 相同，保留更新时间新的
+        import time
+        now = int(time.time() * 1000)
+        a = src("甲-旧域", "https://old-domain.com", lut=now - 86400000)
+        b = src("甲-新域", "https://new-domain.com", lut=now)
+        a["searchUrl"] = b["searchUrl"] = "https://shared.com/search?q={{key}}"
+        out, meta = cyv.premium_filter([a, b], log=lambda *_: None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["bookSourceName"], "甲-新域")
+        self.assertEqual(meta["dropped_crosshost_dup"], 1)
+
+    def test_stale_source_dropped(self):
+        import time
+        old_ms = int((time.time() - 4 * 365 * 24 * 3600) * 1000)
+        ok = src("新", "https://a.com", lut=int(time.time() * 1000))
+        stale = src("超期", "https://b.com", lut=old_ms)
+        out, meta = cyv.premium_filter([ok, stale], log=lambda *_: None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["bookSourceName"], "新")
+        self.assertEqual(meta["dropped_stale"], 1)
+
+    def test_mid_age_source_downgraded_not_dropped(self):
+        import time
+        mid_ms = int((time.time() - 2.5 * 365 * 24 * 3600) * 1000)
+        fresh = src("新", "https://a.com", lut=int(time.time() * 1000))
+        mid = src("老源", "https://b.com", lut=mid_ms)
+        out, meta = cyv.premium_filter([mid, fresh], log=lambda *_: None)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["bookSourceName"], "新", "老源应排到队尾")
+        self.assertEqual(meta["downgraded_age"], 1)
+
+    def test_dirty_timestamp_survives(self):
+        dirty = [src("无时间", "https://a.com"),
+                 src("字符串", "https://b.com", lut="not-a-number"),
+                 src("未来", "https://c.com", lut=4102444800001)]
+        out, _ = cyv.premium_filter(dirty, log=lambda *_: None)
+        self.assertEqual(len(out), 3, "脏时间戳不剔除任何源")
+
+    def test_premium_words_do_not_affect_regular_normalize(self):
+        """C1 回归锁：premium 专用擦边词不得写进全局 adult_filter.txt，
+        否则常规候选的 02_normalize 会被连带过滤。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_norm02_c1", os.path.join(ROOT, "scripts", "02_normalize.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pats = mod.load_adult_patterns()  # 常规路径读取的全局词
+        self.assertFalse(mod.is_adult(src("辣文精选", "https://a.com"), pats)[0],
+                         "premium 专用词不得出现在全局规则中")
+        # 但 premium 路径必须拦得住
+        out, meta = cyv.premium_filter([src("辣文精选", "https://a.com")],
+                                       log=lambda *_: None)
+        self.assertEqual(len(out), 0)
+        self.assertEqual(meta["dropped_adult"], 1)
+
+    def test_adult_domain_matches_subdomain(self):
+        """I3 回归锁：域名名单写主域，须拦住 www 等子域。"""
+        with mock.patch.object(cyv, "load_adult_domains", return_value=["evil-adult.example.com"]):
+            out, meta = cyv.premium_filter(
+                [src("擦边", "https://www.evil-adult.example.com")],
+                log=lambda *_: None)
+        self.assertEqual(len(out), 0)
+        self.assertEqual(meta["dropped_adult_domain"], 1)
+
+    def test_dirty_future_timestamp_not_ranked_first(self):
+        """I2 回归锁：未来脏时间戳不得排到最前。"""
+        import time
+        now = int(time.time() * 1000)
+        dirty = src("未来脏", "https://a.com", lut=4102444800001)
+        normal = src("正常", "https://b.com", lut=now)
+        out, _ = cyv.premium_filter([dirty, normal], log=lambda *_: None)
+        self.assertEqual(out[0]["bookSourceName"], "正常")
+
+    def test_filter_meta_counts_present(self):
+        _, meta = cyv.premium_filter([src("甲", "https://a.com")], log=lambda *_: None)
+        for k in ("dropped_adult_domain", "dropped_crosshost_dup",
+                  "dropped_stale", "downgraded_age"):
+            self.assertIsInstance(meta.get(k), int, "计数键 %s 应为 int" % k)
+
     def test_premium_sorts_by_update_time(self):
-        a = src("旧", "https://a.com", lut=100)
-        b = src("新", "https://b.com", lut=300)
-        c = src("中", "https://c.com", lut=200)
+        import time
+        now = int(time.time() * 1000)
+        day = 86400 * 1000
+        a = src("旧", "https://a.com", lut=now - 3 * day)
+        b = src("新", "https://b.com", lut=now)
+        c = src("中", "https://c.com", lut=now - day)
         out, _ = cyv.premium_filter([a, b, c], log=lambda *_: None)
         self.assertEqual([s["bookSourceName"] for s in out], ["新", "中", "旧"])
 

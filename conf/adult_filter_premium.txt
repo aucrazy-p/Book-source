@@ -1,0 +1,8 @@
+# 仅 premium 新源生效的擦边词（premium_filter 读取，追加到全局规则后）
+# 高置信多字词；禁止加单字（历史误伤 java.ajax / xxxbiquge）。
+# 不要写进 conf/adult_filter.txt——那份被常规候选共用，写这里才只作用于本批新源。
+辣文
+H文
+小黄文
+限制级
+高H

@@ -29,7 +29,8 @@ from urllib.request import Request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-from lib import SYSTEM_OPENER, UA, decode_body, dump_json, run_dir, source_id
+from lib import (SYSTEM_OPENER, UA, content_hash, decode_body, dump_json,
+                 extract_domain, run_dir, source_id)
 
 # 候选种子兜底：上游采集全失败（如 GitHub Actions 机房 IP 被 yiove 403）时，
 # 用上次成功快照的 gzip 种子继续跑，避免池空转。种子只做兜底，正常采集优先。
@@ -49,6 +50,9 @@ PREMIUM_COLLECTION_ID = "df898047-f6f3-4437-93c6-147edc8559b3"
 PREMIUM_MAX_BYTES = 256 * 1024 * 1024   # 大合集导出实测 89MB
 PREMIUM_TIMEOUT = 180                   # 实测下载约 84s，留余量
 ADULT_FILTER_PY = os.path.join(HERE, "02_normalize.py")
+# 死链代理阈值（premium 专用）：更新超 3 年剔除，2~3 年降权排到队尾
+PREMIUM_STALE_YEARS = 3
+PREMIUM_AGE_YEARS = 2
 
 REQUEST_DELAY = 0.8
 RETRIES = 2
@@ -190,6 +194,35 @@ def merge_yck_baseline(sources, baseline_path=None, log=print):
     return out, meta
 
 
+ADULT_DOMAINS_PATH = os.path.join(ROOT, "conf", "adult_domains.txt")
+ADULT_PREMIUM_WORDS_PATH = os.path.join(ROOT, "conf", "adult_filter_premium.txt")
+
+
+def load_premium_adult_words():
+    """读 premium 专用擦边词（# 注释/空行忽略）；缺失/损坏返回 [] 不拖垮筛选。"""
+    try:
+        with open(ADULT_PREMIUM_WORDS_PATH, encoding="utf-8") as f:
+            return [w.strip() for w in f if w.strip() and not w.strip().startswith("#")]
+    except Exception as e:
+        print("[premium] 专用擦边词加载失败（%s），本轮跳过该词表" % str(e)[:60])
+        return []
+
+
+def load_adult_domains():
+    """读域名级成人名单（# 注释/空行忽略）；文件缺失/损坏返回 [] 不拖垮筛选。"""
+    try:
+        out = []
+        with open(ADULT_DOMAINS_PATH, encoding="utf-8") as f:
+            for line in f:
+                d = line.strip()
+                if d and not d.startswith("#"):
+                    out.append(d.lower())
+        return out
+    except Exception as e:
+        print("[premium] 成人域名名单加载失败（%s），本轮跳过域名过滤" % str(e)[:60])
+        return []
+
+
 def _premium_adult_filter():
     """复用 02_normalize 的成人规则（单一真值），加载失败则恒 False 不拖垮筛选。"""
     try:
@@ -197,24 +230,44 @@ def _premium_adult_filter():
         spec = importlib.util.spec_from_file_location("_norm02_premium", ADULT_FILTER_PY)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        pats = mod.load_adult_patterns()
+        pats = mod.load_adult_patterns() + load_premium_adult_words()
         return (lambda s: mod.is_adult(s or {}, pats)[0]), len(pats)
     except Exception as e:
         print("[premium] 警告：成人规则加载失败（%s），本轮跳过成人过滤" % e)
         return (lambda s: False), 0
 
 
-def premium_filter(sources, log=print):
-    """大合集导出 → 精选标准源：过滤 → 成人剔除 → 域名去重 → 按更新时间降序。
+def _real_ms(v):
+    """时间戳归一化：只认真实毫秒/秒级（2000~2100），脏值返回 0。"""
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if 946684800000 <= n <= 4102444800000:
+        return n
+    if 946684800 <= n <= 4102444800:
+        return n * 1000
+    return 0
 
-    只留 searchUrl 非空 + bookSourceUrl 以 http 开头 + 无 jsLib 的标准源
-    （探测内核只执行 HTTP+选择器，跑不了 JS 源）；成人命中 02_normalize 规则剔除；
-    同站换皮按 source_id 去重；按 lastUpdateTime 降序让新源先探。
-    返回 (精选列表, meta)，任何一步失败都降级返回已处理结果，不抛异常。
+
+def premium_filter(sources, log=print):
+    """大合集导出 → 精选标准源（7 步，只作用于 premium 新源）。
+
+    1) 结构：http + searchUrl + 无 jsLib
+    2) 成人：02_normalize 规则 + conf/adult_domains.txt 域名级名单
+    3) 时间解析：脏值兜底 0
+    4) 死链代理：超 3 年剔除、2~3 年降权（真实时间戳才判）
+    5) 同站换皮：source_id 去重
+    6) 跨 host 换皮：content_hash 全局去重，保留最新时间戳那条
+    7) 排序：新源在前，降权源排队尾
+
+    返回 (精选列表, meta)，各步剔除数入 meta，任何一步失败都降级不抛异常。
     """
     meta = {"before": len(sources), "after": 0, "dropped_js": 0,
             "dropped_nosearch": 0, "dropped_nonhttp": 0,
-            "dropped_adult": 0, "dropped_dup": 0}
+            "dropped_adult": 0, "dropped_adult_domain": 0,
+            "dropped_dup": 0, "dropped_crosshost_dup": 0,
+            "dropped_stale": 0, "downgraded_age": 0}
     if not isinstance(sources, list):
         meta["error"] = "payload not a list"
         return [], meta
@@ -239,30 +292,80 @@ def premium_filter(sources, log=print):
     # 2) 成人过滤（复用真实规则）
     is_adult, n_rules = _premium_adult_filter()
     meta["adult_rules"] = n_rules
+    adult_domains = load_adult_domains()
     filtered = []
     for s in kept:
         if is_adult(s):
             meta["dropped_adult"] += 1
+        elif any((lambda d, h: h == d or h.endswith("." + d))(
+                d, extract_domain(str(s.get("bookSourceUrl") or "")))
+                for d in adult_domains):
+            meta["dropped_adult_domain"] += 1
         else:
             filtered.append(s)
 
-    # 3) 同站换皮去重（复用现成 source_id 口径）
-    deduped, dropped = dedupe_by_source_id(filtered, log=log)
-    meta["dropped_dup"] = len(dropped)
-
-    # 4) 按更新时间降序：新源在前，max() 兜底脏时间戳（字符串/None/浮点）
+    # 3) 按更新时间解析时间戳（字符串/None/浮点等脏值兜底为 0）
     def lut(s):
         try:
             return int(s.get("lastUpdateTime") or 0)
         except (TypeError, ValueError, OverflowError):
             return 0
 
-    deduped.sort(key=lut, reverse=True)
+    # 4) 死链代理：超 3 年剔除，2~3 年降权（保留但排到队尾）。
+    # 仅对「真实时间戳」做年龄判定；小整数/未来离谱值视为无有效时间，
+    # 既不剔除也不降权（兼容测试与脏数据，避免误杀）。
+    now_ms = int(time.time() * 1000)
+    year_ms = 365 * 24 * 3600 * 1000
+    fresh = []
+    aged = []
+    for s in filtered:
+        t = _real_ms(s.get("lastUpdateTime"))
+        if t and now_ms - t > PREMIUM_STALE_YEARS * year_ms:
+            meta["dropped_stale"] += 1
+        elif t and now_ms - t > PREMIUM_AGE_YEARS * year_ms:
+            meta["downgraded_age"] += 1
+            aged.append(s)
+        else:
+            fresh.append(s)
+
+    # 5) 同站换皮去重（复用现成 source_id 口径）
+    deduped, dropped = dedupe_by_source_id(fresh + aged, log=log)
+    meta["dropped_dup"] = len(dropped)
+
+    # 6) 跨 host 规则体去重：同 content_hash 只留 lastUpdateTime 最新的一条
+    before_hash_dedup = len(deduped)
+    by_hash = {}
+    hash_samples = []
+    for r in deduped:
+        key = content_hash(r) if isinstance(r, dict) else ""
+        prev = by_hash.get(key)
+        t, pt = (_real_ms(r.get("lastUpdateTime")),
+                 _real_ms(prev.get("lastUpdateTime"))) if prev is not None else (0, 0)
+        if prev is None or (t > pt if (t or pt) else True):
+            by_hash[key] = r
+        elif len(hash_samples) < 10:
+            hash_samples.append("%s←%s" % (
+                str(prev.get("bookSourceName"))[:14], str(r.get("bookSourceName"))[:14]))
+    deduped = list(by_hash.values())
+    meta["dropped_crosshost_dup"] = before_hash_dedup - len(deduped)
+    # 跨 host 去重可能误删「共用规则模板的不同源」——输出样本供人工抽检。
+    if hash_samples:
+        log("[premium] 跨host去重样本(保留←丢弃): %s" % " | ".join(hash_samples))
+
+    # 7) 按更新时间降序：新源在前，降权源（2~3 年）排队尾；无有效时间戳居中
+    aged_ids = {id(s) for s in aged}
+    deduped.sort(key=lambda s: (id(s) not in aged_ids,
+                                _real_ms(s.get("lastUpdateTime")) > 0,
+                                _real_ms(s.get("lastUpdateTime"))),
+                 reverse=True)
     meta["after"] = len(deduped)
-    log("[premium] 筛选 %d→%d（JS %d / 无搜索 %d / 非HTTP %d / 成人 %d / 换皮 %d）"
+    log("[premium] 筛选 %d→%d（JS %d / 无搜索 %d / 非HTTP %d / 成人 %d / 成人域 %d / "
+        "超期 %d / 老源降权 %d / 同站换皮 %d / 跨host换皮 %d）"
         % (meta["before"], meta["after"], meta["dropped_js"],
            meta["dropped_nosearch"], meta["dropped_nonhttp"],
-           meta["dropped_adult"], meta["dropped_dup"]))
+           meta["dropped_adult"], meta["dropped_adult_domain"],
+           meta["dropped_stale"], meta["downgraded_age"],
+           meta["dropped_dup"], meta["dropped_crosshost_dup"]))
     return deduped, meta
 
 
@@ -404,9 +507,15 @@ def collect(run_id, n_cols, n_single, pages, premium=False):
     if premium:
         premium_sources = load_premium_pool(premium_path)
         if premium_sources:
+            # 缓存命中也重跑一遍 premium_filter：周缓存里可能是旧规则筛出的源，
+            # 新筛选（擦边/换皮/超期）应即时生效，不等下周 key 变化。函数幂等。
+            cached_count = len(premium_sources)
+            premium_sources, cached_filter_meta = premium_filter(premium_sources)
             pmeta = {"kind": "premium_cache", "path": premium_path,
-                     "count": len(premium_sources), "from_cache": True}
-            print("[premium] 命中缓存 %d 条 → %s" % (len(premium_sources), premium_path))
+                     "count": cached_count, "from_cache": True,
+                     "refilter": cached_filter_meta}
+            print("[premium] 命中缓存 %d 条（重筛后 %d 条）→ %s"
+                  % (cached_count, len(premium_sources), premium_path))
         else:
             premium_sources, pmeta = fetch_premium_collection()
             if premium_sources:

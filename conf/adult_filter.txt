@@ -40,5 +40,7 @@ yuwangshe
 欲望社
 御书房
 
+# 注：仅 premium 新源生效的擦边词放在 conf/adult_filter_premium.txt，不写这里——
+# 本文件被常规候选的 02_normalize 共用，写这里会连带过滤常规源。
 # 分组标签里的成人标记（只匹配 bookSourceGroup）
 # 见脚本 WEAK_GROUP：涩 / 🔞 / 成人 / r18 / 敏感资源
