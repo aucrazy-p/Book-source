@@ -102,7 +102,7 @@ jobs:
           fi
           python3 scripts/01_fetch_probe_books.py ci
           python3 scripts/02_normalize.py "$SNAP" ci
-          python3 scripts/06_pool.py plan ci --size 50
+          python3 scripts/06_pool.py plan ci --size 66
           python3 scripts/make_probe_input.py ci
           echo "targets=$(wc -l < runs/ci/targets.jsonl) rust_input=$(python3 -c "import json;print(len(json.load(open('runs/ci/probe_input.json'))))")"
 

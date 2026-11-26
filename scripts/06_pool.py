@@ -36,7 +36,8 @@ ROOT = os.path.dirname(HERE)
 from lib import (apply_measured_respond_time, dump_json, dump_jsonl, load_json,
                  load_jsonl, run_dir, runs_root, source_id)
 
-POOL_SIZE = 50
+POOL_SIZE = 66      # 精品池目标容量（用户 2026-11-26 定：50 → 66）
+PROBE_BATCH = 50    # 每轮探测数，与池容量解耦（预算 1200s 约束，不能随池涨到 66）
 FAIL_LIMIT = 2      # 连续 FAILED 达此值移出（真失效）
 BLOCKED_LIMIT = 3   # 连续 BLOCKED 达此值移出（机房 IP 长期连不上，等价于不可用）
 # 搜索污染率门禁（用户 2026-11-21 确认）：no_title_match 占比 ≥25% 判不合格。
@@ -143,11 +144,13 @@ def plan(run_id, size):
 
     if len(st["pool"]) < size:
         mode = "fill"
-        # 每轮固定取 BATCH 个新候选（用户规则：每次测 50 个）。
+        # 每轮固定探 PROBE_BATCH 个新候选（用户规则：每次测 50 个）。
+        # 与池容量 size 解耦：池目标从 50 提到 66 后，若 BATCH=size 会一轮探 66 个，
+        # 撞穿 1200s 探测预算（历史 84 个被 SIGKILL）。故探测数恒定 50。
         # 跳过条件按 source_id（scanned_ids ∪ 池中 ∪ 已淘汰），不按数组索引：
         # 候选每轮由采集重生成、顺序会变（合集访问量/上游更新/新补给并入），
         # 旧 cursor 按索引记会漂移 → 重复探或漏探。按 id 记录则顺序怎么变都不重。
-        BATCH = size  # 每轮探测量 = 池容量（默认 50）
+        BATCH = PROBE_BATCH
         scanned = set(st["scanned_ids"])
         picked = []
         for r in clean:

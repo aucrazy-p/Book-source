@@ -118,6 +118,22 @@ class TestScannedIds(unittest.TestCase):
                          "本轮 picked 的 id 必须写回 state.scanned_ids")
         self.assertIn("cursor", st, "cursor 字段保留供看板显示")
 
+    def test_probe_batch_stays_50_when_pool_size_is_66(self):
+        """回归锁：池目标提到 66 后，每轮探测数必须仍是 50，不能跟着涨。
+
+        历史上 BATCH=size，池 50→66 会让每轮探 66 个，撞穿 1200s 预算
+        （84 个就曾被 SIGKILL）。此用例锁死探测数与池容量解耦。
+        """
+        rows = [cand("s%03d" % i) for i in range(1, 201)]
+        self._write_candidates("batch66", rows)
+        self._write_state(scanned=[])
+        p = mod.plan("batch66", 66)   # 池目标 66
+        targets = mod.load_jsonl(os.path.join(lib.run_dir("batch66"), "targets.jsonl"))
+        new_ids = [t["source_id"] for t in targets if t.get("is_new")]
+        self.assertEqual(len(new_ids), 50,
+                         "池目标 66 时每轮新探测仍须 50 个（预算约束）")
+        self.assertEqual(len(mod.load_state()["scanned_ids"]), 50)
+
     def test_legacy_state_without_scanned_ids(self):
         rows = [cand("s%02d" % i) for i in range(1, 6)]
         self._write_candidates("legacy", rows)
