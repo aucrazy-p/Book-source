@@ -170,11 +170,11 @@ def plan(run_id, size):
             t = dict(t)
             t["is_new"] = True
             targets.append(t)
-        # 池统一清理（方案 §19.3）：判定规则变更后（书名精确+作者校验），
-        # 存量池源必须尽快用新规则复检，不能靠 10 个/轮慢慢轮转——否则
-        # 旧假阳性源（如只能搜到同人的站）会一直占位发布。池未满时源数有限，
-        # 全量复测成本可控；池满 50 后走 recheck 模式天然全量。
-        RECHECK_BATCH = len(st["pool"])
+        # 池内复测（方案 §19.3 存量复检）：按 last_checked_round 优先复测最久未测的。
+        # 数量受 PROBE_BATCH 总预算约束：本轮 targets = 新候选 + 复测 ≤ 50。
+        # 早期实现是「50 新 + 全池复测」，池 65 时单轮 115 个目标撞穿 1200s
+        # 预算被 SIGKILL；池提到 66 后更危险，故复测只在总预算余量内补位。
+        RECHECK_BATCH = max(0, PROBE_BATCH - len(picked))
         due = sorted(st["pool"], key=lambda p: p.get("last_checked_round", -1))
         for p in due[:RECHECK_BATCH]:
             sid = p["source_id"]
@@ -190,14 +190,17 @@ def plan(run_id, size):
                 "is_new": bool(p.get("pending_observe", False)),
                 "risk_level": "clean", "source": p["source"],
             })
-            # 消费标记：下一轮不再强制 observe（一轮足够）。
+            # 消费标记 + 登记轮次，让复测在池内轮转（不总测同一批）。
             p["pending_observe"] = False
+            p["last_checked_round"] = st["round"]
         st["cursor"] = i  # 推进游标，即使没选够也跳过扫描过的
     else:
         mode = "recheck"
-        # 复测池内全部源：用池内存的完整 source 构造目标
+        # 轮转复测：每轮最多 PROBE_BATCH 个，按 last_checked_round 优先测最久未测的。
+        # 池目标 66 > 探测预算 50，若全量复测会撞穿 1200s（同 C2），故分两轮轮转。
         targets = []
-        for p in st["pool"]:
+        due = sorted(st["pool"], key=lambda p: p.get("last_checked_round", -1))
+        for p in due[:PROBE_BATCH]:
             targets.append({
                 "source_id": p["source_id"], "domain": p.get("domain", ""),
                 "bookSourceName": p.get("bookSourceName", ""),
@@ -205,7 +208,10 @@ def plan(run_id, size):
                 "is_new": bool(p.get("pending_observe", False)),
                 "risk_level": "clean", "source": p["source"],
             })
+            # 消费 observe 标记 + 登记本轮轮次，下一轮 due 排序会把刚测过的排后面，
+            # 保证轮转覆盖全池（池 66 约两轮一轮回）。
             p["pending_observe"] = False
+            p["last_checked_round"] = st["round"]
 
     save_state(st)
     plan_obj = {"run_id": run_id, "mode": mode, "planned_at": _now(),

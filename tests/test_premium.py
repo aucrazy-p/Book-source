@@ -93,14 +93,32 @@ class TestPremiumMerge(unittest.TestCase):
         ids = [cyv.source_id(s["bookSourceUrl"]) for s in out]
         self.assertEqual(len(ids), len(set(ids)), "合并后不应有重复 source_id")
         self.assertEqual(len(out), 2)
-        self.assertEqual(meta["added"], 1)
+        # premium 优先：2 条 premium 都进（含与常规"甲"同 source_id 的"甲-换皮"），
+        # 常规的"甲"被去重丢弃 → added=2 / overlap=1。C1 修复前的旧语义是 added=1。
+        self.assertEqual(meta["added"], 2)
         self.assertEqual(meta["overlap"], 1)
+        self.assertEqual(out[0]["bookSourceName"], "甲-换皮", "premium 排在常规之前")
 
     def test_merged_item_marked_premium(self):
         out, _ = cyv.merge_premium_pool([], [src("乙", "https://b.com")],
                                         log=lambda *_: None)
         self.assertEqual(out[0]["_upstream"], "yiove:premium:" + cyv.PREMIUM_COLLECTION_ID)
         self.assertTrue(out[0].get("_is_valid"))
+
+    def test_premium_sources_come_first(self):
+        """回归锁（C1）：premium 必须排在候选前部，否则 plan 从头取 50 永远探不到。
+
+        原实现 append 到常规候选之后 → premium 排在 1623 条常规之后，
+        探测器 budget 内根本轮不到；排序白做，补给形同虚设。
+        """
+        regular = [src("常规%02d" % i, "https://old%d.com" % i) for i in range(1, 6)]
+        premium = [src("精选%02d" % i, "https://new%d.com" % i,
+                       lut=1000 - i) for i in range(1, 4)]
+        out, meta = cyv.merge_premium_pool(regular, premium, log=lambda *_: None)
+        names = [s["bookSourceName"] for s in out]
+        self.assertEqual(names[:3], ["精选01", "精选02", "精选03"],
+                         "premium 新源必须排在候选前部，先于常规旧源被探测")
+        self.assertEqual(names[3:], ["常规01", "常规02", "常规03", "常规04", "常规05"])
 
 
 class TestPremiumIO(unittest.TestCase):

@@ -134,6 +134,53 @@ class TestScannedIds(unittest.TestCase):
                          "池目标 66 时每轮新探测仍须 50 个（预算约束）")
         self.assertEqual(len(mod.load_state()["scanned_ids"]), 50)
 
+    def test_fill_with_nonempty_pool_caps_total_targets_at_50(self):
+        """回归锁（C2）：池非空时 fill 的 targets 总数（新候选+池内复测）≤50。
+
+        原实现 fill = 50 新 + len(pool) 全量复测，池 65 时单轮 115 个目标，
+        撞穿 1200s 预算被 SIGKILL。此用例锁死总数上限。
+        """
+        rows = [cand("s%03d" % i) for i in range(1, 201)]
+        self._write_candidates("fillpool", rows)
+        # 构造 40 个已在池的源（池未满 66 → fill 模式）
+        pool_list = []
+        for i in range(40):
+            sid = "p%02d" % i
+            pool_list.append({
+                "source_id": sid, "domain": sid + ".com",
+                "bookSourceName": sid, "content_hash": "h" + sid,
+                "source": {"bookSourceName": sid, "bookSourceUrl": "https://" + sid + ".com",
+                           "searchUrl": "https://" + sid + ".com/s?q={{key}}"},
+                "added_round": 0, "fail_streak": 0, "blocked_streak": 0, "history": [],
+            })
+        self._write_state(scanned=[], pool_list=pool_list)
+        p = mod.plan("fillpool", 66)
+        targets = mod.load_jsonl(os.path.join(lib.run_dir("fillpool"), "targets.jsonl"))
+        self.assertLessEqual(len(targets), 50,
+                             "池非空时 targets 总数（新+复测）必须 ≤50，不能叠加到 115")
+        self.assertEqual(p["mode"], "fill")
+
+    def test_recheck_caps_targets_at_50(self):
+        """回归锁（C2）：池满 66 进 recheck 后，每轮 targets 仍 ≤50（轮转非全量）。"""
+        pool_list = []
+        for i in range(66):
+            sid = "p%02d" % i
+            pool_list.append({
+                "source_id": sid, "domain": sid + ".com",
+                "bookSourceName": sid, "content_hash": "h" + sid,
+                "source": {"bookSourceName": sid, "bookSourceUrl": "https://" + sid + ".com",
+                           "searchUrl": "https://" + sid + ".com/s?q={{key}}"},
+                "added_round": 0, "last_checked_round": i,
+                "fail_streak": 0, "blocked_streak": 0, "history": [],
+            })
+        self._write_state(scanned=[], pool_list=pool_list)  # 池 66 = size 66 → recheck
+        self._write_candidates("recheck66", [])
+        p = mod.plan("recheck66", 66)
+        targets = mod.load_jsonl(os.path.join(lib.run_dir("recheck66"), "targets.jsonl"))
+        self.assertEqual(p["mode"], "recheck")
+        self.assertLessEqual(len(targets), 50,
+                             "recheck 池 66 时每轮须轮转 ≤50，不是全量 66")
+
     def test_legacy_state_without_scanned_ids(self):
         rows = [cand("s%02d" % i) for i in range(1, 6)]
         self._write_candidates("legacy", rows)

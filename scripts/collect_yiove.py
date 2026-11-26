@@ -303,26 +303,37 @@ def merge_premium_pool(sources, premium, log=print):
     """
     meta = {"kind": "premium_merge", "regular": len(sources),
             "premium": len(premium), "added": 0, "overlap": 0}
-    seen = {source_id(s.get("bookSourceUrl") or "") for s in sources}
-    out = list(sources)
+    # premium 必须排在前面：探测器 06_pool.plan 按数组顺序从头取 BATCH 条，
+    # 且池满后转 recheck 不再读候选。若 premium 追加在常规候选之后，
+    # 1623 条常规旧源会把 6587 条 premium 新源挡在后面 → 预算内永远探不到，
+    # lastUpdateTime 排序白做、补给形同虚设。故 premium 优先，常规让位。
+    premium_out = []
+    seen = set()
     for s in premium:
         if not isinstance(s, dict):
             continue
         key = source_id(s.get("bookSourceUrl") or "")
-        if not key:
-            continue
-        if key in seen:
-            meta["overlap"] += 1
+        if not key or key in seen:
             continue
         seen.add(key)
         s = dict(s)
         s["_upstream"] = "yiove:premium:" + PREMIUM_COLLECTION_ID
         s["_is_valid"] = True
-        out.append(s)
+        premium_out.append(s)
         meta["added"] += 1
+    regular_out = []
+    for s in sources:
+        key = source_id(s.get("bookSourceUrl") or "")
+        if key and key in seen:
+            meta["overlap"] += 1
+            continue
+        if key:
+            seen.add(key)
+        regular_out.append(s)
+    out = premium_out + regular_out
     meta["total"] = len(out)
-    log("[premium] 并入常规候选 +%d 条（premium %d / 重叠 %d）"
-        % (meta["added"], meta["premium"], meta["overlap"]))
+    log("[premium] 并入候选池（premium %d 条前置 / 与常规重叠 %d 条）"
+        % (meta["added"], meta["overlap"]))
     return out, meta
 
 
