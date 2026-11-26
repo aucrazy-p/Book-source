@@ -100,6 +100,9 @@ def init_state(size):
     return {
         "schema": "pool-state-v1", "size": size, "updated_at": _now(),
         "round": 0, "cursor": 0, "pool": [], "retired": {},
+        # 已探过的 source_id 集合：候选列表每轮由采集重生成、顺序会变，
+        # 按数组索引的 cursor 会漂移导致重复/漏扫；按 id 记录则不受重排影响。
+        "scanned_ids": [],
     }
 
 
@@ -113,6 +116,7 @@ def load_state(size=None):
             st.setdefault("pool", [])
             st.setdefault("round", 0)
             st.setdefault("size", POOL_SIZE)
+            st.setdefault("scanned_ids", [])  # 兼容旧 state（无此字段）
             if size is not None:
                 st["size"] = size
             return st
@@ -139,17 +143,24 @@ def plan(run_id, size):
 
     if len(st["pool"]) < size:
         mode = "fill"
-        # 每轮固定取 BATCH 个新候选（用户规则：每次测 50 个），从游标处往后、
-        # 跳过已在池 / 已淘汰的；合格者由 commit 挑最优秀的补进池直到满。
+        # 每轮固定取 BATCH 个新候选（用户规则：每次测 50 个）。
+        # 跳过条件按 source_id（scanned_ids ∪ 池中 ∪ 已淘汰），不按数组索引：
+        # 候选每轮由采集重生成、顺序会变（合集访问量/上游更新/新补给并入），
+        # 旧 cursor 按索引记会漂移 → 重复探或漏探。按 id 记录则顺序怎么变都不重。
         BATCH = size  # 每轮探测量 = 池容量（默认 50）
+        scanned = set(st["scanned_ids"])
         picked = []
-        i = st["cursor"]
-        while i < len(clean) and len(picked) < BATCH:
-            r = clean[i]
+        for r in clean:
+            if len(picked) >= BATCH:
+                break
             sid = r["source_id"]
-            if sid not in pool_ids and sid not in retired:
-                picked.append(r)
-            i += 1
+            if sid in scanned or sid in pool_ids or sid in retired:
+                continue
+            picked.append(r)
+        # 本轮 picked 的 id 记入 scanned_ids，顺序无关。
+        st["scanned_ids"] = list(dict.fromkeys(st["scanned_ids"] + [r["source_id"] for r in picked]))
+        # cursor 仅保留写（看板/历史报告字段兼容），不再用于选源判定。
+        i = len(clean)
         # 出口白名单冷启动（方案 §3.3.1）：新候选首轮标 is_new，强制 observe 一轮。
         targets = []
         for t in picked:
