@@ -54,9 +54,25 @@ jobs:
           workflow_conclusion: success
           if_no_artifact_found: warn
 
+      # ---- 精品源补给缓存（大合集 89MB 只下第一周，之后复用）----
+      # key 含 UUID + 周数（date +%G-W%V，ISO 周），每周一自动失效重下。
+      # 命中缓存时 collect_yiove.py 的 load_premium_pool 直接读，不联网。
+      - name: Compute premium cache key
+        id: premium-cache
+        # key 含 UUID + ISO 周数：同一周内复用，跨周 key 变化 → 自动重新下载。
+        # 故意不设 restore-keys：否则前缀匹配会命中旧周缓存，刷新失效。
+        run: echo "key=premium-df898047-f6f3-4437-93c6-147edc8559b3-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore premium pool from cache
+        uses: actions/cache@v4
+        with:
+          path: runs/ci/premium_pool.jsonl
+          key: ${{ steps.premium-cache.outputs.key }}
+
       - name: Collect candidate sources from yiove
-        # 采集：按合集访问量取前 8 个，不做 3 万条全量；限速 0.8s/请求
-        run: python3 scripts/collect_yiove.py ci --collections 8 --pages 1
+        # 采集：按合集访问量取前 8 个 + 固定大合集精选源补给（--premium）。
+        # 大合集导出 89MB / 84s，缓存命中则跳过下载；限速 0.8s/请求。
+        run: python3 scripts/collect_yiove.py ci --collections 8 --pages 1 --premium
 
       - name: Download probe-kernel binary
         # Rust 四步探测内核（方案 §17.1）：搜索→详情→目录→正文真跑通 + L4 行为观测。
