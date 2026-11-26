@@ -43,20 +43,31 @@ COLS = API + "/shuyuan/book-source-collections"
 SINGLES = API + "/shuyuan/book-sources"
 IMPORT = API + "/import/book-source-collection/"
 
+# 精品源补给：固定大合集 UUID（16724 条，2025-08；按 view_total 排序时排十几名被漏采）。
+# 23041 条那个本机代理 180s 超时放弃，不采；单源库接口 78% 被本合集覆盖，不接。
+PREMIUM_COLLECTION_ID = "df898047-f6f3-4437-93c6-147edc8559b3"
+PREMIUM_MAX_BYTES = 256 * 1024 * 1024   # 大合集导出实测 89MB
+PREMIUM_TIMEOUT = 180                   # 实测下载约 84s，留余量
+ADULT_FILTER_PY = os.path.join(HERE, "02_normalize.py")
+
 REQUEST_DELAY = 0.8
 RETRIES = 2
 TIMEOUT = 30
 
 
-def get_json(url):
-    """GET 并解析 JSON，返回 (obj, meta)；失败返回 (None, meta)。"""
+def get_json(url, max_bytes=8 * 1024 * 1024, timeout=TIMEOUT):
+    """GET 并解析 JSON，返回 (obj, meta)；失败返回 (None, meta)。
+
+    默认参数保持常规采集行为不变（8MB / 30s）。大合集导出（89MB / 84s）
+    由 premium 专用路径显式放大 max_bytes / timeout，不影响普通合集列表。
+    """
     last = ""
     for attempt in range(RETRIES + 1):
         try:
             req = Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
             t0 = time.time()
-            resp = SYSTEM_OPENER.open(req, timeout=TIMEOUT)
-            raw = resp.read(8 * 1024 * 1024)
+            resp = SYSTEM_OPENER.open(req, timeout=timeout)
+            raw = resp.read(max_bytes)
             text = decode_body(raw, resp.headers)
             obj = json.loads(text)
             return obj, {"url": url, "http": resp.status, "bytes": len(raw),
@@ -179,10 +190,147 @@ def merge_yck_baseline(sources, baseline_path=None, log=print):
     return out, meta
 
 
-def collect(run_id, n_cols, n_single, pages):
+def _premium_adult_filter():
+    """复用 02_normalize 的成人规则（单一真值），加载失败则恒 False 不拖垮筛选。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_norm02_premium", ADULT_FILTER_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pats = mod.load_adult_patterns()
+        return (lambda s: mod.is_adult(s or {}, pats)[0]), len(pats)
+    except Exception as e:
+        print("[premium] 警告：成人规则加载失败（%s），本轮跳过成人过滤" % e)
+        return (lambda s: False), 0
+
+
+def premium_filter(sources, log=print):
+    """大合集导出 → 精选标准源：过滤 → 成人剔除 → 域名去重 → 按更新时间降序。
+
+    只留 searchUrl 非空 + bookSourceUrl 以 http 开头 + 无 jsLib 的标准源
+    （探测内核只执行 HTTP+选择器，跑不了 JS 源）；成人命中 02_normalize 规则剔除；
+    同站换皮按 source_id 去重；按 lastUpdateTime 降序让新源先探。
+    返回 (精选列表, meta)，任何一步失败都降级返回已处理结果，不抛异常。
+    """
+    meta = {"before": len(sources), "after": 0, "dropped_js": 0,
+            "dropped_nosearch": 0, "dropped_nonhttp": 0,
+            "dropped_adult": 0, "dropped_dup": 0}
+    if not isinstance(sources, list):
+        meta["error"] = "payload not a list"
+        return [], meta
+
+    # 1) 结构过滤
+    kept = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        url = str(s.get("bookSourceUrl") or "").strip()
+        if not url.lower().startswith("http"):
+            meta["dropped_nonhttp"] += 1
+            continue
+        if s.get("jsLib"):
+            meta["dropped_js"] += 1
+            continue
+        if not str(s.get("searchUrl") or "").strip():
+            meta["dropped_nosearch"] += 1
+            continue
+        kept.append(s)
+
+    # 2) 成人过滤（复用真实规则）
+    is_adult, n_rules = _premium_adult_filter()
+    meta["adult_rules"] = n_rules
+    filtered = []
+    for s in kept:
+        if is_adult(s):
+            meta["dropped_adult"] += 1
+        else:
+            filtered.append(s)
+
+    # 3) 同站换皮去重（复用现成 source_id 口径）
+    deduped, dropped = dedupe_by_source_id(filtered, log=log)
+    meta["dropped_dup"] = len(dropped)
+
+    # 4) 按更新时间降序：新源在前，max() 兜底脏时间戳（字符串/None/浮点）
+    def lut(s):
+        try:
+            return int(s.get("lastUpdateTime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    deduped.sort(key=lut, reverse=True)
+    meta["after"] = len(deduped)
+    log("[premium] 筛选 %d→%d（JS %d / 无搜索 %d / 非HTTP %d / 成人 %d / 换皮 %d）"
+        % (meta["before"], meta["after"], meta["dropped_js"],
+           meta["dropped_nosearch"], meta["dropped_nonhttp"],
+           meta["dropped_adult"], meta["dropped_dup"]))
+    return deduped, meta
+
+
+def load_premium_pool(path):
+    """从 premium_pool.jsonl 读回缓存；文件缺失/损坏返回 []（不报错，触发重下）。"""
+    if not os.path.exists(path):
+        return []
+    try:
+        from lib import load_jsonl
+        return [r for r in load_jsonl(path) if isinstance(r, dict) and r.get("bookSourceUrl")]
+    except Exception as e:
+        print("[premium] 缓存读取失败（%s），将重新下载" % str(e)[:80])
+        return []
+
+
+def fetch_premium_collection(log=print):
+    """下载固定大合集 → premium_filter 精选；失败返回 ([], meta) 降级不报错。"""
+    url = IMPORT + PREMIUM_COLLECTION_ID
+    meta = {"kind": "premium", "collection_id": PREMIUM_COLLECTION_ID, "url": url}
+    obj, fetch_meta = get_json(url, max_bytes=PREMIUM_MAX_BYTES, timeout=PREMIUM_TIMEOUT)
+    meta.update(fetch_meta)
+    if not isinstance(obj, list):
+        meta["error"] = meta.get("error") or "payload not a list"
+        log("[premium] 大合集下载失败/非数组，跳过补给：%s" % meta["error"])
+        return [], meta
+    sources, filter_meta = premium_filter(obj, log=log)
+    meta["filter"] = filter_meta
+    meta["count"] = len(sources)
+    log("[premium] 大合集精选 %d 条（原始 %d）" % (len(sources), len(obj)))
+    return sources, meta
+
+
+def merge_premium_pool(sources, premium, log=print):
+    """把 premium 源并入常规候选，按 source_id 去重（常规优先，premium 只补新的）。
+
+    打 _upstream=yiove:premium:<uuid> + _is_valid=True 便于 provenance 溯源。
+    返回 (合并后列表, meta)。
+    """
+    meta = {"kind": "premium_merge", "regular": len(sources),
+            "premium": len(premium), "added": 0, "overlap": 0}
+    seen = {source_id(s.get("bookSourceUrl") or "") for s in sources}
+    out = list(sources)
+    for s in premium:
+        if not isinstance(s, dict):
+            continue
+        key = source_id(s.get("bookSourceUrl") or "")
+        if not key:
+            continue
+        if key in seen:
+            meta["overlap"] += 1
+            continue
+        seen.add(key)
+        s = dict(s)
+        s["_upstream"] = "yiove:premium:" + PREMIUM_COLLECTION_ID
+        s["_is_valid"] = True
+        out.append(s)
+        meta["added"] += 1
+    meta["total"] = len(out)
+    log("[premium] 并入常规候选 +%d 条（premium %d / 重叠 %d）"
+        % (meta["added"], meta["premium"], meta["overlap"]))
+    return out, meta
+
+
+def collect(run_id, n_cols, n_single, pages, premium=False):
     d = run_dir(run_id)
     os.makedirs(d, exist_ok=True)
     merged, provenance = {}, []
+    premium_path = os.path.join(d, "premium_pool.jsonl")
 
     # 1) 合集列表 → 取高访问量的前 n_cols 个
     col_items = []
@@ -238,6 +386,29 @@ def collect(run_id, n_cols, n_single, pages):
 
     sources = list(merged.values())
     strategy = "top_collections_by_view_total"
+
+    # 精品源补给（--premium）：从固定大合集筛出的精选源并入候选池。
+    # 优先读 Actions cache 落盘的 premium_pool.jsonl；缺失才联网下载并落盘。
+    # 任何失败都降级（返回 []），常规采集照常，不成为 daily 单点故障。
+    if premium:
+        premium_sources = load_premium_pool(premium_path)
+        if premium_sources:
+            pmeta = {"kind": "premium_cache", "path": premium_path,
+                     "count": len(premium_sources), "from_cache": True}
+            print("[premium] 命中缓存 %d 条 → %s" % (len(premium_sources), premium_path))
+        else:
+            premium_sources, pmeta = fetch_premium_collection()
+            if premium_sources:
+                from lib import dump_jsonl
+                dump_jsonl(premium_path, premium_sources)
+                print("[premium] 大合集结果落盘 %d 条 → %s"
+                      % (len(premium_sources), premium_path))
+        provenance.append(pmeta)
+        if premium_sources:
+            sources, merge_meta = merge_premium_pool(sources, premium_sources)
+            provenance.append(merge_meta)
+            strategy += "+premium"
+
     if not sources:
         # 上游全失败（如 CI 机房 IP 被 403）：回退种子，保证池不空转、流程能跑通。
         seed_sources, seed_meta = load_seed()
@@ -282,14 +453,16 @@ def collect(run_id, n_cols, n_single, pages):
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python collect_yiove.py <run_id> [--collections 8] [--single 0] [--pages 1]")
+        print("用法: python collect_yiove.py <run_id> [--collections 8] [--single 0] "
+              "[--pages 1] [--premium]")
         sys.exit(1)
     run_id = sys.argv[1]
 
     def arg(name, default):
         return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
 
-    collect(run_id, arg("--collections", 8), arg("--single", 0), arg("--pages", 1))
+    collect(run_id, arg("--collections", 8), arg("--single", 0), arg("--pages", 1),
+            premium="--premium" in sys.argv)
 
 
 if __name__ == "__main__":
