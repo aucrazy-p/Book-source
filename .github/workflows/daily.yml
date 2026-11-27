@@ -54,14 +54,16 @@ jobs:
           workflow_conclusion: success
           if_no_artifact_found: warn
 
-      # ---- 精品源补给缓存（大合集 89MB 只下第一周，之后复用）----
-      # key 含 UUID + 周数（date +%G-W%V，ISO 周），每周一自动失效重下。
-      # 命中缓存时 collect_yiove.py 的 load_premium_pool 直接读，不联网。
+      # ---- 精品源补给缓存（大合集 89MB 只下第一次，之后永久复用）----
+      # key 固定版本号：候选 8000+ 条筛 66 个足够，无需每周重扫。
+      # daily 每天 restore 即算访问，刷新 GitHub 的 7 天未访问删除计时器 → 缓存不回收。
+      # 命中缓存时 collect_yiove.py 的 load_premium_pool 直接读，重筛后并入候选（规则更新即时生效）。
+      # 要拿上游新版大合集：把下面 key 的 -v1 手动升到 -v2 触发一次重下。
       - name: Compute premium cache key
         id: premium-cache
-        # key 含 UUID + ISO 周数：同一周内复用，跨周 key 变化 → 自动重新下载。
-        # 故意不设 restore-keys：否则前缀匹配会命中旧周缓存，刷新失效。
-        run: echo "key=premium-df898047-f6f3-4437-93c6-147edc8559b3-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+        # 固定 key，不含 date/周数，否则每周失效重下（用户 2026-11-27 定：一次下载即可）。
+        # 故意不设 restore-keys：前缀匹配可能命中旧版本缓存。
+        run: echo "key=premium-df898047-f6f3-4437-93c6-147edc8559b3-v1" >> "$GITHUB_OUTPUT"
 
       - name: Restore premium pool from cache
         uses: actions/cache@v4
