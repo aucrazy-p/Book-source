@@ -222,15 +222,46 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$DST"
-          if git diff --cached --quiet; then
-            echo "sources.json 内容无变化，跳过 commit（避免无意义提交）"
+
+          # 只看 sources.json 是否变化：决定 updated 是否刷新
+          if git diff --cached --quiet -- "$DST"; then
+            SOURCES_CHANGED=0
+            echo "sources.json 内容无变化：updated 保持原值，仅刷新 last_run"
           else
-            # 书源确有变更：同步写入更新时间戳，供 Pages 统计区读取
-            python3 -c "import json,datetime;json.dump({'updated':datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')},open('docs/meta.json','w'))"
-            git add docs/meta.json
-            git commit -m "chore: 自动更新书源 ($(date -u +%Y-%m-%d))"
+            SOURCES_CHANGED=1
+            echo "sources.json 内容有变化：同时刷新 updated 与 last_run"
+          fi
+
+          # meta.json 两个时间戳字段：
+          #   updated  —— 书源内容变更时间（仅 sources.json 有变化才写）
+          #   last_run —— 每天巡检都写（哪怕书源无变化，页面也能看到今天跑过）
+          SOURCES_CHANGED="$SOURCES_CHANGED" python3 - <<'PY'
+          import json, datetime, os
+          now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          path = 'docs/meta.json'
+          try:
+              meta = json.load(open(path))
+          except Exception:
+              meta = {}
+          if not isinstance(meta, dict):
+              meta = {}
+          meta['last_run'] = now
+          if os.environ.get('SOURCES_CHANGED') == '1':
+              meta['updated'] = now
+          meta.setdefault('updated', now)  # 老仓库首次补字段时兜底
+          with open(path, 'w') as f:
+              json.dump(meta, f, ensure_ascii=False)
+          print('meta.json:', meta)
+          PY
+          git add docs/meta.json
+
+          # last_run 每天都会变，故每轮必有提交（Pages 依赖 push 触发重建）
+          if git diff --cached --quiet; then
+            echo "暂存区无变化，跳过 commit"
+          else
+            git commit -m "chore: 每日更新 ($(date -u +%Y-%m-%d))"
             git push origin HEAD:main
-            echo "::notice::已发布 sources.json 到 docs/，Pages 将自动重建"
+            echo "::notice::已发布 sources.json / meta.json 到 docs/，Pages 将自动重建"
           fi
 
       # ---- Actions 记录自动清理：删除 7 天前的 workflow run ----
