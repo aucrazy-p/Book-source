@@ -1732,5 +1732,86 @@
   "_upstream": "yckceo:baseline",
   "_upstream_name": "6月18日校验 余590",
   "_is_valid": true
+ },
+ {
+  "bookSourceUrl": "https://www.ybswa.com",
+  "bookSourceName": "夜伴书屋",
+  "bookSourceGroup": "全部来自论坛",
+  "bookSourceType": 0,
+  "customOrder": -5414,
+  "enabled": true,
+  "enabledExplore": true,
+  "enabledCookieJar": true,
+  "header": "{\"User-Agent\":\"Mozilla/5.0 (Linux; U; Android 13; zh-Hans-CN; PFJM10 Build/TP1A.220905.001) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/100.0.4896.58 Quark/6.13.6.581 Mobile Safari/537.36\",\"Accept-Language\":\"zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7\"}",
+  "bookSourceComment": "",
+  "lastUpdateTime": 1744771801263,
+  "respondTime": 1344,
+  "weight": 0,
+  "exploreUrl": "[\n  {\n    \"title\": \"奇幻·玄幻\",\n    \"url\": \"/list/qihuan.html\"\n  },\n  {\n    \"title\": \"科幻·游戏\",\n    \"url\": \"/list/kehuan.html\"\n  },\n  {\n    \"title\": \"武侠·仙侠\",\n    \"url\": \"/list/wuxia.html\"\n  },\n  {\n    \"title\": \"女生·言情\",\n    \"url\": \"/list/yanqing.html\"\n  },\n  {\n    \"title\": \"都市·娱乐\",\n    \"url\": \"/list/dushi.html\"\n  },\n  {\n    \"title\": \"历史·军事\",\n    \"url\": \"/list/lishi.html\"\n  },\n  {\n    \"title\": \"悬疑·灵异\",\n    \"url\": \"/list/xuanyi.html\"\n  },\n  {\n    \"title\": \"耽美·纯爱\",\n    \"url\": \"/list/chunai.html\"\n  },\n  {\n    \"title\": \"轻小说\",\n    \"url\": \"/list/lightnovel.html\"\n  }\n]",
+  "ruleExplore": {
+   "bookList": "tbody@tr!0",
+   "name": "a.0@text",
+   "author": "td.2@text",
+   "bookUrl": "a.0@href"
+  },
+  "searchUrl": "/plus/search.php?q={{key}}",
+  "ruleSearch": {
+   "bookList": "tbody@tr",
+   "name": "a.0@text##《|》",
+   "author": "td.1@text",
+   "bookUrl": "a.0@href"
+  },
+  "ruleBookInfo": {
+   "name": "[property=\"og:novel:book_name\"]@content",
+   "author": "[property=\"og:novel:author\"]@content",
+   "intro": "[property=\"og:description\"]@content",
+   "kind": "[property~=category|status|update_time]@content",
+   "lastChapter": "[property~=las?test_chapter_name]@content",
+   "coverUrl": "[property=\"og:image\"]@content",
+   "tocUrl": ""
+  },
+  "ruleToc": {
+   "chapterList": "#all-chapter@a",
+   "chapterName": "text",
+   "chapterUrl": "href"
+  },
+  "ruleContent": {
+   "content": "#cont-body@p@html",
+   "nextContentUrl": ".text-center@a.2@href\n@js:\nvar next=/_\\d+\\.html/.test(result) ? result : '';\nnext"
+  },
+  "tag": "夜伴书屋",
+  "searchRule": {
+   "bookList": "tbody@tr",
+   "name": "a.0@text##《|》",
+   "author": "td.1@text",
+   "bookUrl": "a.0@href"
+  },
+  "exploreRule": {
+   "bookList": "tbody@tr!0",
+   "name": "a.0@text",
+   "author": "td.2@text",
+   "bookUrl": "a.0@href"
+  },
+  "bookInfoRule": {
+   "name": "[property=\"og:novel:book_name\"]@content",
+   "author": "[property=\"og:novel:author\"]@content",
+   "intro": "[property=\"og:description\"]@content",
+   "kind": "[property~=category|status|update_time]@content",
+   "lastChapter": "[property~=las?test_chapter_name]@content",
+   "coverUrl": "[property=\"og:image\"]@content",
+   "tocUrl": ""
+  },
+  "tocRule": {
+   "chapterList": "#all-chapter@a",
+   "chapterName": "text",
+   "chapterUrl": "href"
+  },
+  "contentRule": {
+   "content": "#cont-body@p@html",
+   "nextContentUrl": ".text-center@a.2@href\n@js:\nvar next=/_\\d+\\.html/.test(result) ? result : '';\nnext"
+  },
+  "key": "https://www.ybswa.com",
+  "_upstream": "yiove:premium:df898047-f6f3-4437-93c6-147edc8559b3",
+  "_is_valid": true
  }
 ]
