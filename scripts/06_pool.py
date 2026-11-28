@@ -28,13 +28,17 @@ import json
 import os
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from urllib.parse import urlparse
+from urllib.request import Request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-from lib import (apply_measured_respond_time, dump_json, dump_jsonl, load_json,
-                 load_jsonl, run_dir, runs_root, source_id)
+from lib import (DIRECT, UA, apply_measured_respond_time, dump_json, dump_jsonl,
+                 load_json, load_jsonl, parse_search_url, run_dir, runs_root,
+                 source_id)
 
 POOL_SIZE = 66      # 精品池目标容量（用户 2026-11-26 定：50 → 66）
 PROBE_BATCH = 50    # 每轮探测数，与池容量解耦（预算 1200s 约束，不能随池涨到 66）
@@ -43,6 +47,87 @@ BLOCKED_LIMIT = 3   # 连续 BLOCKED 达此值移出（机房 IP 长期连不上
 # 搜索污染率门禁（用户 2026-11-21 确认）：no_title_match 占比 ≥25% 判不合格。
 # 挡住"多数书命中、招牌书全是同人/错书"的站（如 sou78 47%）。严格不等号：达到即淘汰。
 MISMATCH_LIMIT = 0.25
+
+# 跨域重定向过滤（2026-11-28）：站点换域（ybswa.com→yybsw.com）时，探测内核
+# 跟随 301 用新域内容判 PASSED、出库却是旧域 URL，用户端搜不到。导出前对每个
+# 池内源做一次轻量请求，比对最终落地 host；换域即移出池。网络异常一律放行。
+CROSS_DOMAIN_TIMEOUT = 8
+CROSS_DOMAIN_WORKERS = 8
+_DEFAULT_CHECK_KEYWORD = "我的"
+
+
+def _norm_host(h: str) -> str:
+    """host 规范化：小写、去尾点、去 www. 前缀。空值返回空串。"""
+    h = str(h or "").strip().lower().rstrip(".")
+    return h[4:] if h.startswith("www.") else h
+
+
+def same_site_host(a: str, b: str) -> bool:
+    """两个 host 是否同站：规范化后相等，或互为子域（含 www. 别名）。
+
+    空 host 返回 False（调用方据此不拦截）。后缀比较必须带 '.' 边界，
+    避免 notfoo.com 被当成 foo.com 的子域。
+    """
+    a, b = _norm_host(a), _norm_host(b)
+    if not a or not b:
+        return False
+    return a == b or b.endswith("." + a) or a.endswith("." + b)
+
+
+def search_final_host(source: dict, opener=None, timeout: int = CROSS_DOMAIN_TIMEOUT) -> str:
+    """搜索 URL 跟随重定向后的最终 host；失败/动态 JS 返回空串（不拦截）。
+
+    用源自带 checkKeyWord（缺省「我的」）构造搜索地址，只读 1 字节不拉全文。
+    异常一律吞掉返回空串——网络抖动不能让好源被误删。
+    """
+    kw = str(source.get("checkKeyWord", "") or "").strip() or _DEFAULT_CHECK_KEYWORD
+    parsed = parse_search_url(source, kw)
+    if parsed is None:
+        return ""
+    try:
+        url, method, body = parsed
+        req = Request(url, method=method or "GET",
+                      data=body.encode("utf-8") if body else None,
+                      headers={"User-Agent": UA})
+        resp = (opener or DIRECT).open(req, timeout=timeout)
+        try:
+            return _norm_host(urlparse(resp.geturl()).hostname)
+        finally:
+            close = getattr(resp, "close", None)
+            if close:
+                close()
+    except Exception:
+        return ""
+
+
+def cross_domain_sources(pool: list, opener=None, workers: int = CROSS_DOMAIN_WORKERS,
+                         timeout: int = CROSS_DOMAIN_TIMEOUT) -> dict:
+    """并发检查池内源是否换域名。返回 {source_id: {"orig":..., "final":...}}。
+
+    只收跨域的源；原始 host 为空、最终 host 为空、同站的都不记入。
+    """
+    targets = [p for p in pool if isinstance(p.get("source"), dict)]
+    if not targets:
+        return {}
+
+    def one(p):
+        orig = _norm_host(urlparse(str(p["source"].get("bookSourceUrl", "") or "")).hostname)
+        final = search_final_host(p["source"], opener=opener, timeout=timeout)
+        if orig and final and not same_site_host(orig, final):
+            return p["source_id"], {"orig": orig, "final": final}
+        return None
+
+    got = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = [ex.submit(one, p) for p in targets]
+        for fut in as_completed(futs):
+            try:
+                hit = fut.result()
+            except Exception:
+                hit = None
+            if hit:
+                got[hit[0]] = hit[1]
+    return got
 
 
 def mismatch_rate(r):
@@ -385,6 +470,9 @@ def commit(run_id, fail_limit, blocked_limit):
     # 命中即移出池并记入 retired，确保 docs/sources.json 只含 clean 源。
     # 风险来源：matrix 的 risk_level（L4 行为观测）写回池内 history，取最近一次。
     is_adult, n_rules = _adult_blocker()
+    # 跨域重定向检查（2026-11-28）：一次并发轻量请求拿所有池内源的最终落地域。
+    # 与成人/污染率过滤并列，命中即走下面的 retired 链路；网络失败返回空、不拦截。
+    cross_by_id = cross_domain_sources(st["pool"])
     risk_by_id = {r["source_id"]: r.get("risk_level") for r in rows}
     status_by_id = {r["source_id"]: r.get("status") for r in rows}
     rows_by_id = {r["source_id"]: r for r in rows}
@@ -441,6 +529,12 @@ def commit(run_id, fail_limit, blocked_limit):
             if should_retire_by_mismatch(p, row):
                 reason = "mismatch_filter:%.0f%%>=%.0f%%" % (
                     mismatch_rate(row) * 100, MISMATCH_LIMIT * 100)
+
+            # 跨域重定向：源换了域名，探测跟随 301 判 PASSED 但出库旧 URL 用户端不可用。
+            # 与污染率同口径——一票否决，不受出口白名单误伤守卫影响。
+            if p["source_id"] in cross_by_id:
+                c = cross_by_id[p["source_id"]]
+                reason = "cross_domain_redirect:%s→%s" % (c["orig"], c["final"])
         if reason:
             st["retired"][p["source_id"]] = {
                 "reason": reason, "name": p.get("bookSourceName"),
@@ -456,10 +550,12 @@ def commit(run_id, fail_limit, blocked_limit):
         # 混在一句里容易被误读成"移出 N 个成人源"（历史日志就出现过这个歧义）。
         n_adult = sum(1 for _, r in safety_removed if r.startswith("adult_filter:"))
         n_mismatch = sum(1 for _, r in safety_removed if r.startswith("mismatch_filter:"))
-        n_risk = len(safety_removed) - n_adult - n_mismatch
+        n_cross = sum(1 for _, r in safety_removed if r.startswith("cross_domain_redirect:"))
+        n_risk = len(safety_removed) - n_adult - n_mismatch - n_cross
         print("[池] 二次安全过滤：移出 %d 个（成人规则命中 %d 个 / 污染率超标 %d 个 / "
-              "risk 过滤 %d 个；规则库 %d 条），池内剩 %d"
-              % (len(safety_removed), n_adult, n_mismatch, n_risk, n_rules, len(st["pool"])))
+              "跨域换域 %d 个 / risk 过滤 %d 个；规则库 %d 条），池内剩 %d"
+              % (len(safety_removed), n_adult, n_mismatch, n_cross, n_risk, n_rules,
+                 len(st["pool"])))
     if guard_blocks:
         print("[池] 出口白名单误伤守卫：%d 个源因 blocked_hosts 非空被保留（待人工核对）:"
               % len(guard_blocks))
